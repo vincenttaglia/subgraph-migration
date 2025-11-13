@@ -17,6 +17,8 @@
 # Optional Environment Variables:
 #   OVERRIDE_SHARD     - Override the shard value for the target deployment
 #                        (defaults to source shard if not set)
+#   TEMP_DIR           - Override the temporary directory for migration files
+#                        (defaults to /tmp/subgraph_migration_$$)
 ################################################################################
 
 set -euo pipefail
@@ -73,6 +75,39 @@ check_environment() {
     fi
 
     log_success "All required environment variables are set"
+}
+
+# Function to setup temporary directory
+setup_MIGRATION_TEMP_DIR() {
+    if [[ -n "${TEMP_DIR:-}" ]]; then
+        # Use user-specified temp directory
+        export MIGRATION_TEMP_DIR="$TEMP_DIR"
+        log_info "Using custom temp directory: $MIGRATION_TEMP_DIR"
+    else
+        # Use default temp directory with process ID
+        export MIGRATION_TEMP_DIR="/tmp/subgraph_migration_$$"
+        log_info "Using default temp directory: $MIGRATION_TEMP_DIR"
+    fi
+
+    # Create the directory if it doesn't exist
+    if [[ ! -d "$MIGRATION_TEMP_DIR" ]]; then
+        mkdir -p "$MIGRATION_TEMP_DIR" || {
+            log_error "Failed to create temp directory: $MIGRATION_TEMP_DIR"
+            exit 1
+        }
+        log_success "Temp directory created"
+    else
+        log_success "Temp directory already exists"
+    fi
+}
+
+# Function to cleanup temporary directory
+cleanup_MIGRATION_TEMP_DIR() {
+    if [[ -d "$MIGRATION_TEMP_DIR" ]]; then
+        log_info "Cleaning up temporary files..."
+        rm -rf "$MIGRATION_TEMP_DIR"
+        log_success "Temp directory cleaned up"
+    fi
 }
 
 # Function to validate database connectivity
@@ -227,10 +262,6 @@ migrate_metadata() {
 
     log_info "Migrating metadata for deployment '$deployment_hash'..."
 
-    # Create temporary dump files
-    local temp_dir="/tmp/subgraph_migration_$$"
-    mkdir -p "$temp_dir"
-
     # Insert into deployment_schemas with new ID and schema name
     log_info "Inserting into deployment_schemas..."
     psql "$TARGET_METADATA_DB" -c "
@@ -281,12 +312,12 @@ migrate_metadata() {
             psql "$SOURCE_METADATA_DB" -c "
                 COPY (SELECT * FROM subgraphs.graph_node_versions WHERE id = $version_id)
                 TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-            " > "$temp_dir/graph_node_versions.tsv" 2>&1 || {
+            " > "$MIGRATION_TEMP_DIR/graph_node_versions.tsv" 2>&1 || {
                 log_warning "Could not export graph_node_version"
             }
 
-            if [ -s "$temp_dir/graph_node_versions.tsv" ]; then
-                cat "$temp_dir/graph_node_versions.tsv" | psql "$TARGET_METADATA_DB" -c "
+            if [ -s "$MIGRATION_TEMP_DIR/graph_node_versions.tsv" ]; then
+                cat "$MIGRATION_TEMP_DIR/graph_node_versions.tsv" | psql "$TARGET_METADATA_DB" -c "
                     COPY subgraphs.graph_node_versions FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
                 " 2>&1 | grep -v "^COPY" || true
                 log_info "Graph node version $version_id migrated"
@@ -306,15 +337,15 @@ migrate_metadata() {
     psql "$SOURCE_METADATA_DB" -c "
         COPY (SELECT * FROM subgraphs.head WHERE id = $SOURCE_ID)
         TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-    " > "$temp_dir/head_source.tsv"
+    " > "$MIGRATION_TEMP_DIR/head_source.tsv"
 
-    if [ -s "$temp_dir/head_source.tsv" ]; then
+    if [ -s "$MIGRATION_TEMP_DIR/head_source.tsv" ]; then
         # Replace the source ID with target ID using Python for CSV parsing
         python3 -c "
 import csv
 target_id = '${TARGET_ID}'.strip()
-with open('$temp_dir/head_source.tsv', 'r') as infile, \
-     open('$temp_dir/head.tsv', 'w') as outfile:
+with open('$MIGRATION_TEMP_DIR/head_source.tsv', 'r') as infile, \
+     open('$MIGRATION_TEMP_DIR/head.tsv', 'w') as outfile:
     reader = csv.reader(infile, delimiter='\t')
     writer = csv.writer(outfile, delimiter='\t', lineterminator='\n')
     for row in reader:
@@ -322,7 +353,7 @@ with open('$temp_dir/head_source.tsv', 'r') as infile, \
             row[0] = target_id  # Replace ID unconditionally
         writer.writerow(row)
 "
-        cat "$temp_dir/head.tsv" | psql "$TARGET_METADATA_DB" -c "
+        cat "$MIGRATION_TEMP_DIR/head.tsv" | psql "$TARGET_METADATA_DB" -c "
             COPY subgraphs.head FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
         " 2>&1 | grep -v "^COPY" || log_info "Head record already exists (ignored)"
     else
@@ -344,12 +375,12 @@ with open('$temp_dir/head_source.tsv', 'r') as infile, \
     psql "$SOURCE_METADATA_DB" -c "
         COPY (SELECT * FROM subgraphs.deployment WHERE subgraph = '$deployment_hash')
         TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-    " > "$temp_dir/deployment_source.tsv"
+    " > "$MIGRATION_TEMP_DIR/deployment_source.tsv"
 
-    if [ -s "$temp_dir/deployment_source.tsv" ]; then
+    if [ -s "$MIGRATION_TEMP_DIR/deployment_source.tsv" ]; then
         # Debug: show the source data
         log_info "Source deployment data:"
-        cat "$temp_dir/deployment_source.tsv"
+        cat "$MIGRATION_TEMP_DIR/deployment_source.tsv"
 
         # CSV format may quote fields, use python for reliable CSV parsing and field replacement
         # Note: We need to find which column is the 'id' field
@@ -369,8 +400,8 @@ except ValueError:
 
 print(f'DEBUG: ID column is at index {id_index}', file=sys.stderr)
 
-with open('$temp_dir/deployment_source.tsv', 'r') as infile, \
-     open('$temp_dir/deployment.tsv', 'w') as outfile:
+with open('$MIGRATION_TEMP_DIR/deployment_source.tsv', 'r') as infile, \
+     open('$MIGRATION_TEMP_DIR/deployment.tsv', 'w') as outfile:
     reader = csv.reader(infile, delimiter='\t')
     writer = csv.writer(outfile, delimiter='\t', lineterminator='\n')
 
@@ -383,9 +414,9 @@ with open('$temp_dir/deployment_source.tsv', 'r') as infile, \
 
         # Debug: show the transformed data
         log_info "Transformed deployment data:"
-        cat "$temp_dir/deployment.tsv"
+        cat "$MIGRATION_TEMP_DIR/deployment.tsv"
 
-        cat "$temp_dir/deployment.tsv" | psql "$TARGET_METADATA_DB" -c "
+        cat "$MIGRATION_TEMP_DIR/deployment.tsv" | psql "$TARGET_METADATA_DB" -c "
             COPY subgraphs.deployment FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
         " 2>&1 | grep -v "^COPY" || log_warning "Deployment record may already exist (ignored)"
 
@@ -412,12 +443,12 @@ with open('$temp_dir/deployment_source.tsv', 'r') as infile, \
     psql "$SOURCE_METADATA_DB" -c "
         COPY (SELECT * FROM subgraphs.subgraph_manifest WHERE id = $SOURCE_ID)
         TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-    " > "$temp_dir/manifest_source.tsv"
+    " > "$MIGRATION_TEMP_DIR/manifest_source.tsv"
 
-    if [ -s "$temp_dir/manifest_source.tsv" ]; then
+    if [ -s "$MIGRATION_TEMP_DIR/manifest_source.tsv" ]; then
         # Debug: show the source data
         log_info "Source manifest data (first 200 chars):"
-        head -c 200 "$temp_dir/manifest_source.tsv"
+        head -c 200 "$MIGRATION_TEMP_DIR/manifest_source.tsv"
         echo ""
 
         # Replace the source ID with target ID using Python for CSV parsing
@@ -437,8 +468,8 @@ except ValueError:
 
 print(f'DEBUG: Manifest ID column is at index {id_index}', file=sys.stderr)
 
-with open('$temp_dir/manifest_source.tsv', 'r') as infile, \
-     open('$temp_dir/manifest.tsv', 'w') as outfile:
+with open('$MIGRATION_TEMP_DIR/manifest_source.tsv', 'r') as infile, \
+     open('$MIGRATION_TEMP_DIR/manifest.tsv', 'w') as outfile:
     reader = csv.reader(infile, delimiter='\t')
     writer = csv.writer(outfile, delimiter='\t', lineterminator='\n')
     for row in reader:
@@ -449,11 +480,11 @@ with open('$temp_dir/manifest_source.tsv', 'r') as infile, \
 "
         # Debug: show the transformed data
         log_info "Transformed manifest data (first 200 chars):"
-        head -c 200 "$temp_dir/manifest.tsv"
+        head -c 200 "$MIGRATION_TEMP_DIR/manifest.tsv"
         echo ""
 
         # Import with matching format
-        cat "$temp_dir/manifest.tsv" | psql "$TARGET_METADATA_DB" -c "
+        cat "$MIGRATION_TEMP_DIR/manifest.tsv" | psql "$TARGET_METADATA_DB" -c "
             COPY subgraphs.subgraph_manifest FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
         " 2>&1 | grep -v "^COPY" || log_warning "Manifest may already exist (ignored)"
     else
@@ -466,10 +497,10 @@ with open('$temp_dir/manifest_source.tsv', 'r') as infile, \
     psql "$SOURCE_METADATA_DB" -c "
         COPY (SELECT * FROM subgraphs.subgraph_error WHERE subgraph_id = '$deployment_hash')
         TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-    " > "$temp_dir/errors.tsv"
+    " > "$MIGRATION_TEMP_DIR/errors.tsv"
 
-    if [ -s "$temp_dir/errors.tsv" ]; then
-        cat "$temp_dir/errors.tsv" | psql "$TARGET_METADATA_DB" -c "
+    if [ -s "$MIGRATION_TEMP_DIR/errors.tsv" ]; then
+        cat "$MIGRATION_TEMP_DIR/errors.tsv" | psql "$TARGET_METADATA_DB" -c "
             COPY subgraphs.subgraph_error FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
         " 2>&1 | grep -v "^COPY" || log_warning "Some errors may already exist (ignored)"
     else
@@ -482,10 +513,10 @@ with open('$temp_dir/manifest_source.tsv', 'r') as infile, \
     psql "$SOURCE_METADATA_DB" -c "
         COPY (SELECT * FROM subgraphs.dynamic_ethereum_contract_data_source WHERE deployment = '$deployment_hash')
         TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-    " > "$temp_dir/dynamic_sources.tsv"
+    " > "$MIGRATION_TEMP_DIR/dynamic_sources.tsv"
 
-    if [ -s "$temp_dir/dynamic_sources.tsv" ]; then
-        cat "$temp_dir/dynamic_sources.tsv" | psql "$TARGET_METADATA_DB" -c "
+    if [ -s "$MIGRATION_TEMP_DIR/dynamic_sources.tsv" ]; then
+        cat "$MIGRATION_TEMP_DIR/dynamic_sources.tsv" | psql "$TARGET_METADATA_DB" -c "
             COPY subgraphs.dynamic_ethereum_contract_data_source FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
         " 2>&1 | grep -v "^COPY" || log_warning "Some dynamic sources may already exist (ignored)"
     else
@@ -506,10 +537,10 @@ with open('$temp_dir/manifest_source.tsv', 'r') as infile, \
     psql "$SOURCE_METADATA_DB" -c "
         COPY (SELECT * FROM subgraphs.subgraph_version WHERE deployment = '$deployment_hash')
         TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-    " > "$temp_dir/subgraph_version.tsv"
+    " > "$MIGRATION_TEMP_DIR/subgraph_version.tsv"
 
     local subgraph_id=""
-    if [ -s "$temp_dir/subgraph_version.tsv" ]; then
+    if [ -s "$MIGRATION_TEMP_DIR/subgraph_version.tsv" ]; then
         # Extract the subgraph ID from the subgraph_version record using column-aware approach
         subgraph_id=$(python3 -c "
 import sys
@@ -524,7 +555,7 @@ except ValueError:
     print('ERROR: Could not find subgraph column in subgraph_version table', file=sys.stderr)
     sys.exit(1)
 
-with open('$temp_dir/subgraph_version.tsv', 'r') as infile:
+with open('$MIGRATION_TEMP_DIR/subgraph_version.tsv', 'r') as infile:
     reader = csv.reader(infile, delimiter='\t')
     for row in reader:
         if row and len(row) > subgraph_index:
@@ -534,7 +565,7 @@ with open('$temp_dir/subgraph_version.tsv', 'r') as infile:
 
         log_info "Found subgraph_id: $subgraph_id"
 
-        cat "$temp_dir/subgraph_version.tsv" | psql "$TARGET_METADATA_DB" -c "
+        cat "$MIGRATION_TEMP_DIR/subgraph_version.tsv" | psql "$TARGET_METADATA_DB" -c "
             COPY subgraphs.subgraph_version FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
         " 2>&1 | grep -v "^COPY" || log_warning "Subgraph version may already exist (ignored)"
     else
@@ -548,10 +579,10 @@ with open('$temp_dir/subgraph_version.tsv', 'r') as infile:
         psql "$SOURCE_METADATA_DB" -c "
             COPY (SELECT * FROM subgraphs.subgraph WHERE id = '$subgraph_id')
             TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " > "$temp_dir/subgraph.tsv"
+        " > "$MIGRATION_TEMP_DIR/subgraph.tsv"
 
-        if [ -s "$temp_dir/subgraph.tsv" ]; then
-            cat "$temp_dir/subgraph.tsv" | psql "$TARGET_METADATA_DB" -c "
+        if [ -s "$MIGRATION_TEMP_DIR/subgraph.tsv" ]; then
+            cat "$MIGRATION_TEMP_DIR/subgraph.tsv" | psql "$TARGET_METADATA_DB" -c "
                 COPY subgraphs.subgraph FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
             " 2>&1 | grep -v "^COPY" || log_warning "Subgraph entry may already exist (ignored)"
         else
@@ -576,9 +607,9 @@ with open('$temp_dir/subgraph_version.tsv', 'r') as infile:
     psql "$SOURCE_METADATA_DB" -c "
         COPY (SELECT * FROM subgraphs.subgraph_deployment_assignment WHERE id = $SOURCE_ID)
         TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-    " > "$temp_dir/assignment_source.tsv"
+    " > "$MIGRATION_TEMP_DIR/assignment_source.tsv"
 
-    if [ -s "$temp_dir/assignment_source.tsv" ]; then
+    if [ -s "$MIGRATION_TEMP_DIR/assignment_source.tsv" ]; then
         # Replace the source ID with target ID using Python for CSV parsing
         # Note: We only replace the 'id' column, NOT the 'node_id' column
         python3 -c "
@@ -597,8 +628,8 @@ except ValueError:
 
 print(f'DEBUG: Assignment ID column is at index {id_index}', file=sys.stderr)
 
-with open('$temp_dir/assignment_source.tsv', 'r') as infile, \
-     open('$temp_dir/assignment.tsv', 'w') as outfile:
+with open('$MIGRATION_TEMP_DIR/assignment_source.tsv', 'r') as infile, \
+     open('$MIGRATION_TEMP_DIR/assignment.tsv', 'w') as outfile:
     reader = csv.reader(infile, delimiter='\t')
     writer = csv.writer(outfile, delimiter='\t', lineterminator='\n')
     for row in reader:
@@ -607,7 +638,7 @@ with open('$temp_dir/assignment_source.tsv', 'r') as infile, \
             row[id_index] = target_id
         writer.writerow(row)
 "
-        cat "$temp_dir/assignment.tsv" | psql "$TARGET_METADATA_DB" -c "
+        cat "$MIGRATION_TEMP_DIR/assignment.tsv" | psql "$TARGET_METADATA_DB" -c "
             COPY subgraphs.subgraph_deployment_assignment FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
         " 2>&1 | grep -v "^COPY" || log_warning "Deployment assignment may already exist (ignored)"
     else
@@ -615,7 +646,7 @@ with open('$temp_dir/assignment_source.tsv', 'r') as infile, \
     fi
 
     # Clean up temp files
-    rm -rf "$temp_dir"
+    rm -rf "$MIGRATION_TEMP_DIR"
 
     log_success "Metadata migration completed"
 }
@@ -922,8 +953,12 @@ main() {
     # Pre-flight checks
     check_environment
     validate_connectivity
+    setup_temp_dir
     check_deployment_exists "$deployment_hash"
     check_deployment_not_in_target "$deployment_hash"
+
+    # Setup cleanup trap
+    trap cleanup_temp_dir EXIT
 
     # Get deployment info and prepare target
     get_deployment_info "$deployment_hash"

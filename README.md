@@ -66,6 +66,29 @@ export OVERRIDE_SHARD="shard2"
 ./migrate_subgraph_deployment.sh QmYg7FibZJJDvS4PZu8kXF5iCkCqGH7PjCPjXP8gZiH5J5
 ```
 
+**TEMP_DIR**: Override the temporary directory for migration files
+
+By default, the script creates temporary files in `/tmp/subgraph_migration_$$` (where `$$` is the process ID). You can override this to use a different location:
+
+```bash
+export TEMP_DIR="/var/lib/migrations/temp"
+```
+
+This is useful when:
+- `/tmp` has limited disk space and you have large deployments
+- You need to use a faster disk for temporary files (e.g., SSD vs HDD)
+- You want to preserve temporary files for debugging (disable cleanup trap)
+- Your system has `/tmp` mounted with `noexec` flag
+
+Example:
+```bash
+# Use a custom temp directory with more space
+export TEMP_DIR="/mnt/large-disk/migration-temp"
+./migrate_subgraph_deployment.sh QmYg7FibZJJDvS4PZu8kXF5iCkCqGH7PjCPjXP8gZiH5J5
+```
+
+**Note**: The script automatically creates the temp directory if it doesn't exist and cleans it up when the migration completes (or fails).
+
 ## Usage
 
 ```bash
@@ -162,6 +185,14 @@ All references to the schema name are automatically updated during migration.
 - If metadata migration fails, it will roll back
 - Data migration uses `pg_dump`/`psql` which handles its own consistency
 
+### Temporary Files
+
+The script creates temporary files during migration:
+- Default location: `/tmp/subgraph_migration_<PID>`
+- Can be overridden with `TEMP_DIR` environment variable
+- Automatically cleaned up on completion or failure (via EXIT trap)
+- Ensure sufficient disk space in the temp directory (especially for large deployments)
+
 ### Rollback Considerations
 
 This script does NOT automatically rollback on failure. If migration fails partway through:
@@ -255,6 +286,8 @@ Subgraph Deployment Migration Tool
 [SUCCESS] All required environment variables are set
 [INFO] Validating database connectivity...
 [SUCCESS] All database connections validated
+[INFO] Using default temp directory: /tmp/subgraph_migration_12345
+[SUCCESS] Temp directory created
 [INFO] Checking if deployment 'QmYg7...' exists in source...
 [SUCCESS] Deployment found in source database
 [INFO] Checking if deployment already exists in target...
@@ -341,6 +374,9 @@ Tables:
   - account
   ...
 ========================================
+
+[INFO] Cleaning up temporary files...
+[SUCCESS] Temp directory cleaned up
 
 [SUCCESS] Migration completed successfully!
 ```
