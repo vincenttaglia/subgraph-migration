@@ -78,7 +78,7 @@ check_environment() {
 }
 
 # Function to setup temporary directory
-setup_MIGRATION_TEMP_DIR() {
+setup_temp_dir() {
     if [[ -n "${TEMP_DIR:-}" ]]; then
         # Use user-specified temp directory
         export MIGRATION_TEMP_DIR="$TEMP_DIR"
@@ -102,7 +102,7 @@ setup_MIGRATION_TEMP_DIR() {
 }
 
 # Function to cleanup temporary directory
-cleanup_MIGRATION_TEMP_DIR() {
+cleanup_temp_dir() {
     if [[ -d "$MIGRATION_TEMP_DIR" ]]; then
         log_info "Cleaning up temporary files..."
         rm -rf "$MIGRATION_TEMP_DIR"
