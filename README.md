@@ -30,7 +30,7 @@ The script works with Graph Node's sharded architecture:
 
 ### Configure Environment Variables
 
-Set the following environment variables with your database connection strings:
+Set the following required environment variables with your database connection strings:
 
 ```bash
 export SOURCE_METADATA_DB="postgresql://user:password@source-host:5432/graph-metadata"
@@ -42,6 +42,28 @@ export TARGET_DATA_DB="postgresql://user:password@target-host:5432/graph-data"
 Connection string format:
 ```
 postgresql://[user[:password]@][host][:port][/dbname][?param1=value1&...]
+```
+
+#### Optional Environment Variables
+
+**OVERRIDE_SHARD**: Override the shard value for the target deployment
+
+By default, the script preserves the shard value from the source deployment. If you need to migrate a deployment to a different shard in the target database, set this variable:
+
+```bash
+export OVERRIDE_SHARD="shard2"
+```
+
+This is useful when:
+- Rebalancing deployments across shards
+- Migrating to a cluster with different shard naming conventions
+- Moving deployments to specific shards for performance optimization
+
+Example:
+```bash
+# Migrate deployment from "primary" shard to "shard2"
+export OVERRIDE_SHARD="shard2"
+./migrate_subgraph_deployment.sh QmYg7FibZJJDvS4PZu8kXF5iCkCqGH7PjCPjXP8gZiH5J5
 ```
 
 ## Usage
@@ -243,11 +265,15 @@ Subgraph Deployment Migration Tool
 [SUCCESS] Next deployment ID: 123
 [INFO] Generating target schema name...
 [SUCCESS] Target schema name: sgd123
+[INFO] Determining target shard...
+[SUCCESS] Using source shard: primary
 
 [WARNING] About to migrate deployment:
   Deployment:    QmYg7FibZJJDvS4PZu8kXF5iCkCqGH7PjCPjXP8gZiH5J5
   Source Schema: sgd42 (ID: 42)
   Target Schema: sgd123 (ID: 123)
+  Source Shard:  primary
+  Target Shard:  primary
 
 Proceed with migration? (y/N): y
 
@@ -303,7 +329,8 @@ Target Schema:      sgd123
 Source ID:          42
 Target ID:          123
 Network:            mainnet
-Shard:              primary
+Source Shard:       primary
+Target Shard:       primary
 
 Tables Migrated:    15
 
@@ -342,6 +369,30 @@ for deployment in "${deployments[@]}"; do
         echo "✗ $deployment migration failed"
         exit 1
     fi
+done
+```
+
+### Migrating to Different Shards
+
+You can migrate deployments to specific shards using the `OVERRIDE_SHARD` environment variable:
+
+```bash
+#!/bin/bash
+
+# Migrate deployments to different shards for load balancing
+export OVERRIDE_SHARD="shard1"
+./migrate_subgraph_deployment.sh QmYg7FibZJJDvS4PZu8kXF5iCkCqGH7PjCPjXP8gZiH5J5
+
+export OVERRIDE_SHARD="shard2"
+./migrate_subgraph_deployment.sh QmXYZ123...
+
+export OVERRIDE_SHARD="shard3"
+./migrate_subgraph_deployment.sh QmABC456...
+
+# Or migrate all to the same shard
+export OVERRIDE_SHARD="primary"
+for deployment in "${deployments[@]}"; do
+    ./migrate_subgraph_deployment.sh "$deployment"
 done
 ```
 

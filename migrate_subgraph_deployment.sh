@@ -13,6 +13,10 @@
 #   SOURCE_DATA_DB     - Source data database connection string
 #   TARGET_METADATA_DB - Target metadata database connection string
 #   TARGET_DATA_DB     - Target data database connection string
+#
+# Optional Environment Variables:
+#   OVERRIDE_SHARD     - Override the shard value for the target deployment
+#                        (defaults to source shard if not set)
 ################################################################################
 
 set -euo pipefail
@@ -204,6 +208,19 @@ generate_target_schema_name() {
     log_success "Target schema name: $TARGET_NAME"
 }
 
+# Function to determine target shard
+determine_target_shard() {
+    log_info "Determining target shard..."
+
+    if [[ -n "${OVERRIDE_SHARD:-}" ]]; then
+        export TARGET_SHARD="$OVERRIDE_SHARD"
+        log_success "Using override shard: $TARGET_SHARD (source was: $SOURCE_SHARD)"
+    else
+        export TARGET_SHARD="$SOURCE_SHARD"
+        log_success "Using source shard: $TARGET_SHARD"
+    fi
+}
+
 # Function to migrate metadata tables
 migrate_metadata() {
     local deployment_hash=$1
@@ -223,7 +240,7 @@ migrate_metadata() {
             '$SOURCE_CREATED_AT',
             '$SOURCE_SUBGRAPH',
             '$TARGET_NAME',
-            '$SOURCE_SHARD',
+            '$TARGET_SHARD',
             '$SOURCE_VERSION',
             '$SOURCE_NETWORK',
             '$SOURCE_ACTIVE'
@@ -856,7 +873,8 @@ generate_summary() {
     echo "Source ID:          $SOURCE_ID"
     echo "Target ID:          $TARGET_ID"
     echo "Network:            $SOURCE_NETWORK"
-    echo "Shard:              $SOURCE_SHARD"
+    echo "Source Shard:       $SOURCE_SHARD"
+    echo "Target Shard:       $TARGET_SHARD"
     echo ""
 
     if [[ -n "$SOURCE_TABLES" ]]; then
@@ -911,6 +929,7 @@ main() {
     get_deployment_info "$deployment_hash"
     get_next_deployment_id
     generate_target_schema_name
+    determine_target_shard
 
     # Confirmation
     echo ""
@@ -918,6 +937,8 @@ main() {
     echo "  Deployment:    $deployment_hash"
     echo "  Source Schema: $SOURCE_NAME (ID: $SOURCE_ID)"
     echo "  Target Schema: $TARGET_NAME (ID: $TARGET_ID)"
+    echo "  Source Shard:  $SOURCE_SHARD"
+    echo "  Target Shard:  $TARGET_SHARD"
     echo ""
     read -p "Proceed with migration? (y/N): " -n 1 -r
     echo
