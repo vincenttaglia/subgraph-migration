@@ -89,6 +89,28 @@ export TEMP_DIR="/mnt/large-disk/migration-temp"
 
 **Note**: The script automatically creates the temp directory if it doesn't exist and cleans it up when the migration completes (or fails).
 
+**GRAPH_NODE_CONFIG**: Path to graph-node config file for graphman pause/resume
+
+If set, the script will pause the source subgraph before migration and resume it after completion (or on failure):
+
+```bash
+export GRAPH_NODE_CONFIG="/path/to/graph-node-config.toml"
+```
+
+This is useful when:
+- You want to ensure the source subgraph is not actively indexing during migration
+- You need to prevent write conflicts during the migration process
+- You want to safely migrate a deployment that's actively running
+
+Example:
+```bash
+# Pause subgraph during migration
+export GRAPH_NODE_CONFIG="/etc/graph-node/config.toml"
+./migrate_subgraph_deployment.sh QmYg7FibZJJDvS4PZu8kXF5iCkCqGH7PjCPjXP8gZiH5J5
+```
+
+**Note**: The `graphman` command is known to segfault after successfully completing operations. The script handles this gracefully and continues execution. The subgraph will be automatically resumed even if the migration fails.
+
 ## Usage
 
 ```bash

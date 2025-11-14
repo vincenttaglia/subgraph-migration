@@ -19,6 +19,8 @@
 #                        (defaults to source shard if not set)
 #   TEMP_DIR           - Override the temporary directory for migration files
 #                        (defaults to /tmp/subgraph_migration_$$)
+#   GRAPH_NODE_CONFIG  - Path to graph-node config file for graphman commands
+#                        If set, runs graphman pause before and resume after migration
 ################################################################################
 
 set -euo pipefail
@@ -253,6 +255,64 @@ determine_target_shard() {
     else
         export TARGET_SHARD="$SOURCE_SHARD"
         log_success "Using source shard: $TARGET_SHARD"
+    fi
+}
+
+# Function to pause subgraph using graphman
+pause_subgraph() {
+    local schema_name=$1
+
+    if [[ -n "${GRAPH_NODE_CONFIG:-}" ]]; then
+        log_info "Pausing subgraph $schema_name using graphman..."
+
+        # Run graphman pause, ignoring segfault (exit code 139 or -11)
+        # We check stdout/stderr for success message before the segfault
+        local output=""
+        output=$(graphman --config "$GRAPH_NODE_CONFIG" pause "$schema_name" 2>&1) || {
+            local exit_code=$?
+            # Exit code 139 is segfault (128 + 11), -11 is also segfault signal
+            if [[ $exit_code -eq 139 ]] || [[ $exit_code -eq 245 ]]; then
+                log_warning "graphman segfaulted after pause command (this is expected)"
+            else
+                log_warning "graphman pause exited with code $exit_code: $output"
+            fi
+        }
+
+        # Show output for debugging
+        if [[ -n "$output" ]]; then
+            echo "$output" | grep -i "paused\|success" && log_success "Subgraph $schema_name paused" || log_info "Graphman output: $output"
+        fi
+    else
+        log_info "GRAPH_NODE_CONFIG not set, skipping graphman pause"
+    fi
+}
+
+# Function to resume subgraph using graphman
+resume_subgraph() {
+    local schema_name=$1
+
+    if [[ -n "${GRAPH_NODE_CONFIG:-}" ]]; then
+        log_info "Resuming subgraph $schema_name using graphman..."
+
+        # Run graphman resume, ignoring segfault (exit code 139 or -11)
+        # We check stdout/stderr for success message before the segfault
+        local output=""
+        output=$(graphman --config "$GRAPH_NODE_CONFIG" resume "$schema_name" 2>&1) || {
+            local exit_code=$?
+            # Exit code 139 is segfault (128 + 11), -11 is also segfault signal
+            if [[ $exit_code -eq 139 ]] || [[ $exit_code -eq 245 ]]; then
+                log_warning "graphman segfaulted after resume command (this is expected)"
+            else
+                log_warning "graphman resume exited with code $exit_code: $output"
+            fi
+        }
+
+        # Show output for debugging
+        if [[ -n "$output" ]]; then
+            echo "$output" | grep -i "resumed\|success" && log_success "Subgraph $schema_name resumed" || log_info "Graphman output: $output"
+        fi
+    else
+        log_info "GRAPH_NODE_CONFIG not set, skipping graphman resume"
     fi
 }
 
@@ -1087,8 +1147,17 @@ main() {
     echo ""
     log_info "Starting migration..."
 
+    # Pause source subgraph if GRAPH_NODE_CONFIG is set
+    pause_subgraph "$SOURCE_NAME"
+
+    # Update cleanup trap to include resume
+    trap "resume_subgraph \"$SOURCE_NAME\"; cleanup_temp_dir" EXIT
+
     migrate_metadata "$deployment_hash"
     migrate_data "$deployment_hash"
+
+    # Resume source subgraph (will also be called by EXIT trap, but that's ok)
+    resume_subgraph "$SOURCE_NAME"
 
     # Perform consistency checks
     echo ""
