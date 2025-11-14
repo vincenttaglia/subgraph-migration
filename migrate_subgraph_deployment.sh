@@ -283,7 +283,7 @@ migrate_metadata() {
 
     # Get the version ID needed by this deployment (with error handling)
     local version_id=""
-    version_id=$(psql "$SOURCE_METADATA_DB" -t -A -c "
+    version_id=$(psql "$SOURCE_DATA_DB" -t -A -c "
         SELECT graph_node_version_id
         FROM subgraphs.subgraph_manifest
         WHERE id = $SOURCE_ID;
@@ -299,7 +299,7 @@ migrate_metadata() {
         log_info "Found graph_node_version_id: $version_id"
 
         # Check if this version already exists in target
-        local version_exists=$(psql "$TARGET_METADATA_DB" -t -A -c "
+        local version_exists=$(psql "$TARGET_DATA_DB" -t -A -c "
             SELECT COUNT(*) FROM subgraphs.graph_node_versions WHERE id = $version_id;
         " 2>&1) || {
             log_warning "Could not check if version exists in target"
@@ -309,7 +309,7 @@ migrate_metadata() {
         if [ "$version_exists" = "0" ]; then
             log_info "Migrating graph_node_version $version_id..."
             # Version doesn't exist, migrate it
-            psql "$SOURCE_METADATA_DB" -c "
+            psql "$SOURCE_DATA_DB" -c "
                 COPY (SELECT * FROM subgraphs.graph_node_versions WHERE id = $version_id)
                 TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
             " > "$MIGRATION_TEMP_DIR/graph_node_versions.tsv" 2>&1 || {
@@ -317,7 +317,7 @@ migrate_metadata() {
             }
 
             if [ -s "$MIGRATION_TEMP_DIR/graph_node_versions.tsv" ]; then
-                cat "$MIGRATION_TEMP_DIR/graph_node_versions.tsv" | psql "$TARGET_METADATA_DB" -c "
+                cat "$MIGRATION_TEMP_DIR/graph_node_versions.tsv" | psql "$TARGET_DATA_DB" -c "
                     COPY subgraphs.graph_node_versions FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
                 " 2>&1 | grep -v "^COPY" || true
                 log_info "Graph node version $version_id migrated"
@@ -334,7 +334,7 @@ migrate_metadata() {
     # Migrate subgraphs.head (required by deployment FK)
     log_info "Migrating subgraph head..."
 
-    psql "$SOURCE_METADATA_DB" -c "
+    psql "$SOURCE_DATA_DB" -c "
         COPY (SELECT * FROM subgraphs.head WHERE id = $SOURCE_ID)
         TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
     " > "$MIGRATION_TEMP_DIR/head_source.tsv"
@@ -353,7 +353,7 @@ with open('$MIGRATION_TEMP_DIR/head_source.tsv', 'r') as infile, \
             row[0] = target_id  # Replace ID unconditionally
         writer.writerow(row)
 "
-        cat "$MIGRATION_TEMP_DIR/head.tsv" | psql "$TARGET_METADATA_DB" -c "
+        cat "$MIGRATION_TEMP_DIR/head.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.head FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
         " 2>&1 | grep -v "^COPY" || log_info "Head record already exists (ignored)"
     else
@@ -432,7 +432,7 @@ with open('$MIGRATION_TEMP_DIR/deployment_source.tsv', 'r') as infile, \
 
     # Get column structure for manifest table
     log_info "Getting column structure for subgraphs.subgraph_manifest..."
-    local manifest_columns=$(psql "$SOURCE_METADATA_DB" -t -A -c "
+    local manifest_columns=$(psql "$SOURCE_DATA_DB" -t -A -c "
         SELECT string_agg(column_name, ', ' ORDER BY ordinal_position)
         FROM information_schema.columns
         WHERE table_schema = 'subgraphs' AND table_name = 'subgraph_manifest';
@@ -440,7 +440,7 @@ with open('$MIGRATION_TEMP_DIR/deployment_source.tsv', 'r') as infile, \
     log_info "Manifest table columns: $manifest_columns"
 
     # Use COPY to export with proper NULL handling
-    psql "$SOURCE_METADATA_DB" -c "
+    psql "$SOURCE_DATA_DB" -c "
         COPY (SELECT * FROM subgraphs.subgraph_manifest WHERE id = $SOURCE_ID)
         TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
     " > "$MIGRATION_TEMP_DIR/manifest_source.tsv"
@@ -484,7 +484,7 @@ with open('$MIGRATION_TEMP_DIR/manifest_source.tsv', 'r') as infile, \
         echo ""
 
         # Import with matching format
-        cat "$MIGRATION_TEMP_DIR/manifest.tsv" | psql "$TARGET_METADATA_DB" -c "
+        cat "$MIGRATION_TEMP_DIR/manifest.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.subgraph_manifest FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
         " 2>&1 | grep -v "^COPY" || log_warning "Manifest may already exist (ignored)"
     else
@@ -494,13 +494,13 @@ with open('$MIGRATION_TEMP_DIR/manifest_source.tsv', 'r') as infile, \
     # Migrate subgraphs.subgraph_error (if any)
     log_info "Migrating subgraph_error records..."
 
-    psql "$SOURCE_METADATA_DB" -c "
+    psql "$SOURCE_DATA_DB" -c "
         COPY (SELECT * FROM subgraphs.subgraph_error WHERE subgraph_id = '$deployment_hash')
         TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
     " > "$MIGRATION_TEMP_DIR/errors.tsv"
 
     if [ -s "$MIGRATION_TEMP_DIR/errors.tsv" ]; then
-        cat "$MIGRATION_TEMP_DIR/errors.tsv" | psql "$TARGET_METADATA_DB" -c "
+        cat "$MIGRATION_TEMP_DIR/errors.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.subgraph_error FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
         " 2>&1 | grep -v "^COPY" || log_warning "Some errors may already exist (ignored)"
     else
@@ -510,13 +510,13 @@ with open('$MIGRATION_TEMP_DIR/manifest_source.tsv', 'r') as infile, \
     # Migrate dynamic data sources (if any)
     log_info "Migrating dynamic ethereum contract data sources..."
 
-    psql "$SOURCE_METADATA_DB" -c "
+    psql "$SOURCE_DATA_DB" -c "
         COPY (SELECT * FROM subgraphs.dynamic_ethereum_contract_data_source WHERE deployment = '$deployment_hash')
         TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
     " > "$MIGRATION_TEMP_DIR/dynamic_sources.tsv"
 
     if [ -s "$MIGRATION_TEMP_DIR/dynamic_sources.tsv" ]; then
-        cat "$MIGRATION_TEMP_DIR/dynamic_sources.tsv" | psql "$TARGET_METADATA_DB" -c "
+        cat "$MIGRATION_TEMP_DIR/dynamic_sources.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.dynamic_ethereum_contract_data_source FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
         " 2>&1 | grep -v "^COPY" || log_warning "Some dynamic sources may already exist (ignored)"
     else
@@ -527,14 +527,14 @@ with open('$MIGRATION_TEMP_DIR/manifest_source.tsv', 'r') as infile, \
     log_info "Migrating subgraph_version..."
 
     # Get column structure for subgraph_version table
-    local version_columns=$(psql "$SOURCE_METADATA_DB" -t -A -c "
+    local version_columns=$(psql "$SOURCE_DATA_DB" -t -A -c "
         SELECT string_agg(column_name, ', ' ORDER BY ordinal_position)
         FROM information_schema.columns
         WHERE table_schema = 'subgraphs' AND table_name = 'subgraph_version';
     ")
     log_info "Subgraph_version table columns: $version_columns"
 
-    psql "$SOURCE_METADATA_DB" -c "
+    psql "$SOURCE_DATA_DB" -c "
         COPY (SELECT * FROM subgraphs.subgraph_version WHERE deployment = '$deployment_hash')
         TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
     " > "$MIGRATION_TEMP_DIR/subgraph_version.tsv"
@@ -565,7 +565,7 @@ with open('$MIGRATION_TEMP_DIR/subgraph_version.tsv', 'r') as infile:
 
         log_info "Found subgraph_id: $subgraph_id"
 
-        cat "$MIGRATION_TEMP_DIR/subgraph_version.tsv" | psql "$TARGET_METADATA_DB" -c "
+        cat "$MIGRATION_TEMP_DIR/subgraph_version.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.subgraph_version FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
         " 2>&1 | grep -v "^COPY" || log_warning "Subgraph version may already exist (ignored)"
     else
@@ -576,13 +576,13 @@ with open('$MIGRATION_TEMP_DIR/subgraph_version.tsv', 'r') as infile:
     if [ -n "$subgraph_id" ] && [ "$subgraph_id" != "" ]; then
         log_info "Migrating subgraph entry for id=$subgraph_id..."
 
-        psql "$SOURCE_METADATA_DB" -c "
+        psql "$SOURCE_DATA_DB" -c "
             COPY (SELECT * FROM subgraphs.subgraph WHERE id = '$subgraph_id')
             TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
         " > "$MIGRATION_TEMP_DIR/subgraph.tsv"
 
         if [ -s "$MIGRATION_TEMP_DIR/subgraph.tsv" ]; then
-            cat "$MIGRATION_TEMP_DIR/subgraph.tsv" | psql "$TARGET_METADATA_DB" -c "
+            cat "$MIGRATION_TEMP_DIR/subgraph.tsv" | psql "$TARGET_DATA_DB" -c "
                 COPY subgraphs.subgraph FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
             " 2>&1 | grep -v "^COPY" || log_warning "Subgraph entry may already exist (ignored)"
         else
@@ -597,14 +597,14 @@ with open('$MIGRATION_TEMP_DIR/subgraph_version.tsv', 'r') as infile:
 
     # Get column structure for assignment table
     log_info "Getting column structure for subgraphs.subgraph_deployment_assignment..."
-    local assignment_columns=$(psql "$SOURCE_METADATA_DB" -t -A -c "
+    local assignment_columns=$(psql "$SOURCE_DATA_DB" -t -A -c "
         SELECT string_agg(column_name, ', ' ORDER BY ordinal_position)
         FROM information_schema.columns
         WHERE table_schema = 'subgraphs' AND table_name = 'subgraph_deployment_assignment';
     ")
     log_info "Assignment table columns: $assignment_columns"
 
-    psql "$SOURCE_METADATA_DB" -c "
+    psql "$SOURCE_DATA_DB" -c "
         COPY (SELECT * FROM subgraphs.subgraph_deployment_assignment WHERE id = $SOURCE_ID)
         TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
     " > "$MIGRATION_TEMP_DIR/assignment_source.tsv"
@@ -638,15 +638,12 @@ with open('$MIGRATION_TEMP_DIR/assignment_source.tsv', 'r') as infile, \
             row[id_index] = target_id
         writer.writerow(row)
 "
-        cat "$MIGRATION_TEMP_DIR/assignment.tsv" | psql "$TARGET_METADATA_DB" -c "
+        cat "$MIGRATION_TEMP_DIR/assignment.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.subgraph_deployment_assignment FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
         " 2>&1 | grep -v "^COPY" || log_warning "Deployment assignment may already exist (ignored)"
     else
         log_info "No deployment assignment to migrate"
     fi
-
-    # Clean up temp files
-    rm -rf "$MIGRATION_TEMP_DIR"
 
     log_success "Metadata migration completed"
 }
@@ -856,7 +853,7 @@ perform_consistency_checks() {
 
     # Check 5: Verify subgraph_manifest exists with correct ID
     log_info "Check 5: Verifying subgraph_manifest entry..."
-    local manifest_exists=$(psql "$TARGET_METADATA_DB" -t -A -c "
+    local manifest_exists=$(psql "$TARGET_DATA_DB" -t -A -c "
         SELECT COUNT(*) FROM subgraphs.subgraph_manifest
         WHERE id = $TARGET_ID;
     ")
