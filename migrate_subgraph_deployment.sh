@@ -556,14 +556,11 @@ with open('$MIGRATION_TEMP_DIR/manifest_source.tsv', 'r') as infile, \
     log_info "Migrating subgraph_features records..."
 
     psql "$SOURCE_DATA_DB" -c "
-        COPY (SELECT * FROM subgraphs.subgraph_features WHERE id = $SOURCE_ID)
+        COPY (SELECT * FROM subgraphs.subgraph_features WHERE id = '$deployment_hash')
         TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-    " > "$MIGRATION_TEMP_DIR/features_source.tsv"
+    " > "$MIGRATION_TEMP_DIR/features.tsv"
 
-    if [ -s "$MIGRATION_TEMP_DIR/features_source.tsv" ]; then
-        # Replace the source ID with target ID
-        sed "s/^$SOURCE_ID\t/$TARGET_ID\t/" "$MIGRATION_TEMP_DIR/features_source.tsv" > "$MIGRATION_TEMP_DIR/features.tsv"
-
+    if [ -s "$MIGRATION_TEMP_DIR/features.tsv" ]; then
         log_info "Importing features to data database..."
         cat "$MIGRATION_TEMP_DIR/features.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.subgraph_features FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
