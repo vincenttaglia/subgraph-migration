@@ -832,33 +832,67 @@ get_source_tables() {
     log_success "Found $table_count tables in source schema"
 }
 
-# Function to migrate schema structure
+# Function to migrate schema structure (tables only, no indexes)
 migrate_schema_structure() {
     local source_schema=$1
     local target_schema=$2
 
-    log_info "Migrating schema structure from '$source_schema' to '$target_schema'..."
+    log_info "Migrating schema structure from '$source_schema' to '$target_schema' (tables only, indexes deferred)..."
 
-    # Dump schema structure (without data)
-    local temp_schema_file="/tmp/schema_${source_schema}_$$.sql"
+    # Dump schema structure (without data, without indexes)
+    local temp_schema_file="$MIGRATION_TEMP_DIR/schema_${source_schema}.sql"
 
     pg_dump "$SOURCE_DATA_DB" \
         --schema="$source_schema" \
         --schema-only \
         --no-owner \
         --no-privileges \
+        --exclude-table-data='*' \
         > "$temp_schema_file"
 
-    # Replace schema name in dump
+    # Split the dump into two files: one for tables/constraints, one for indexes
+    # We'll extract indexes and save them for later
+    local temp_indexes_file="$MIGRATION_TEMP_DIR/indexes_${source_schema}.sql"
+
+    # Extract CREATE INDEX statements to separate file
+    grep -i "^CREATE.*INDEX" "$temp_schema_file" > "$temp_indexes_file" || true
+
+    # Remove CREATE INDEX statements from schema file
+    sed -i '/^CREATE.*INDEX/d' "$temp_schema_file"
+
+    # Replace schema name in both dumps
     sed -i "s/${source_schema}/${target_schema}/g" "$temp_schema_file"
+    sed -i "s/${source_schema}/${target_schema}/g" "$temp_indexes_file"
 
-    # Apply schema to target
-    psql "$TARGET_DATA_DB" < "$temp_schema_file"
+    # Apply schema (tables and constraints only) to target
+    psql "$TARGET_DATA_DB" -q < "$temp_schema_file"
 
-    # Clean up
-    rm -f "$temp_schema_file"
+    log_success "Schema structure migrated (without indexes)"
+}
 
-    log_success "Schema structure migrated"
+# Function to migrate indexes after data is loaded
+migrate_indexes() {
+    local source_schema=$1
+    local target_schema=$2
+
+    log_info "Creating indexes on '$target_schema' (this may take a while for large tables)..."
+
+    local temp_indexes_file="$MIGRATION_TEMP_DIR/indexes_${source_schema}.sql"
+
+    if [[ ! -f "$temp_indexes_file" ]] || [[ ! -s "$temp_indexes_file" ]]; then
+        log_info "No indexes to create"
+        return 0
+    fi
+
+    # Count indexes for progress reporting
+    local index_count=$(grep -c "^CREATE" "$temp_indexes_file" || echo "0")
+    log_info "Creating $index_count indexes..."
+
+    # Apply indexes to target
+    # We use -q to reduce output, and allow errors (some indexes might already exist)
+    psql "$TARGET_DATA_DB" -q < "$temp_indexes_file" 2>&1 | grep -v "already exists" || true
+
+    log_success "Indexes created"
 }
 
 # Function to migrate table data
@@ -914,15 +948,18 @@ migrate_data() {
     # Create target schema
     create_target_schema
 
-    # Migrate schema structure
+    # Migrate schema structure (tables and constraints, but NOT indexes)
     migrate_schema_structure "$SOURCE_NAME" "$TARGET_NAME"
 
-    # Migrate each table
+    # Migrate each table's data
     while IFS= read -r table; do
         migrate_table_data "$SOURCE_NAME" "$TARGET_NAME" "$table"
     done <<< "$SOURCE_TABLES"
 
     log_success "Data migration completed"
+
+    # Now create indexes after all data is loaded (much faster)
+    migrate_indexes "$SOURCE_NAME" "$TARGET_NAME"
 }
 
 # Function to perform consistency checks

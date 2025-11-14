@@ -155,8 +155,9 @@ Migrates the following tables from source to target metadata database:
 ### 4. Data Migration
 
 - Creates the new schema in the target data database
-- Migrates the complete schema structure (tables, indexes, constraints)
-- Copies all data from each table
+- Migrates the schema structure (tables and constraints, **indexes deferred**)
+- Copies all data from each table without index maintenance overhead
+- Creates indexes after all data is loaded (much faster for large tables)
 - Verifies row counts match for each table
 
 ### 5. Consistency Checks
@@ -284,11 +285,26 @@ Migration time depends on:
 - Database server performance
 - Number of tables and indexes
 
-For large deployments (>100GB):
+### Index Optimization
+
+The script automatically optimizes index handling for faster migrations:
+
+1. **During schema migration**: Creates tables and constraints, but **defers index creation**
+2. **During data copy**: No index maintenance overhead, allowing maximum throughput
+3. **After data load**: Builds all indexes at once on complete tables (much faster than incremental updates)
+
+This optimization can **dramatically speed up large table migrations** (potentially 10x+ faster for heavily indexed tables).
+
+### Large Deployments (>100GB)
+
+For large deployments:
+- Expect most migration time in data copy and index creation phases
+- Network throughput during COPY will be high (hundreds of Mbps)
+- Disk writes may be bursty due to PostgreSQL checkpoint behavior
+- Index creation phase may take significant time but shows steady progress
 - Consider running during low-traffic periods
 - Monitor disk space on target
 - Use connection pooling if available
-- Consider parallel table migration for very large deployments (requires script modification)
 
 ## Example Session
 
