@@ -483,10 +483,16 @@ with open('$MIGRATION_TEMP_DIR/manifest_source.tsv', 'r') as infile, \
         head -c 200 "$MIGRATION_TEMP_DIR/manifest.tsv"
         echo ""
 
-        # Import with matching format
+        # Import to both metadata and data databases
+        log_info "Importing manifest to data database..."
         cat "$MIGRATION_TEMP_DIR/manifest.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.subgraph_manifest FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " 2>&1 | grep -v "^COPY" || log_warning "Manifest may already exist (ignored)"
+        " 2>&1 | grep -v "^COPY" || log_warning "Manifest may already exist in data DB (ignored)"
+
+        log_info "Importing manifest to metadata database..."
+        cat "$MIGRATION_TEMP_DIR/manifest.tsv" | psql "$TARGET_METADATA_DB" -c "
+            COPY subgraphs.subgraph_manifest FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
+        " 2>&1 | grep -v "^COPY" || log_warning "Manifest may already exist in metadata DB (ignored)"
     else
         log_warning "No manifest data found for deployment"
     fi
@@ -500,11 +506,42 @@ with open('$MIGRATION_TEMP_DIR/manifest_source.tsv', 'r') as infile, \
     " > "$MIGRATION_TEMP_DIR/errors.tsv"
 
     if [ -s "$MIGRATION_TEMP_DIR/errors.tsv" ]; then
+        log_info "Importing errors to data database..."
         cat "$MIGRATION_TEMP_DIR/errors.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.subgraph_error FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " 2>&1 | grep -v "^COPY" || log_warning "Some errors may already exist (ignored)"
+        " 2>&1 | grep -v "^COPY" || log_warning "Some errors may already exist in data DB (ignored)"
+
+        log_info "Importing errors to metadata database..."
+        cat "$MIGRATION_TEMP_DIR/errors.tsv" | psql "$TARGET_METADATA_DB" -c "
+            COPY subgraphs.subgraph_error FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
+        " 2>&1 | grep -v "^COPY" || log_warning "Some errors may already exist in metadata DB (ignored)"
     else
         log_info "No subgraph errors to migrate"
+    fi
+
+    # Migrate subgraphs.subgraph_features (if any)
+    log_info "Migrating subgraph_features records..."
+
+    psql "$SOURCE_DATA_DB" -c "
+        COPY (SELECT * FROM subgraphs.subgraph_features WHERE id = $SOURCE_ID)
+        TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
+    " > "$MIGRATION_TEMP_DIR/features_source.tsv"
+
+    if [ -s "$MIGRATION_TEMP_DIR/features_source.tsv" ]; then
+        # Replace the source ID with target ID
+        sed "s/^$SOURCE_ID\t/$TARGET_ID\t/" "$MIGRATION_TEMP_DIR/features_source.tsv" > "$MIGRATION_TEMP_DIR/features.tsv"
+
+        log_info "Importing features to data database..."
+        cat "$MIGRATION_TEMP_DIR/features.tsv" | psql "$TARGET_DATA_DB" -c "
+            COPY subgraphs.subgraph_features FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
+        " 2>&1 | grep -v "^COPY" || log_warning "Some features may already exist in data DB (ignored)"
+
+        log_info "Importing features to metadata database..."
+        cat "$MIGRATION_TEMP_DIR/features.tsv" | psql "$TARGET_METADATA_DB" -c "
+            COPY subgraphs.subgraph_features FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
+        " 2>&1 | grep -v "^COPY" || log_warning "Some features may already exist in metadata DB (ignored)"
+    else
+        log_info "No subgraph features to migrate"
     fi
 
     # Migrate dynamic data sources (if any)
@@ -565,9 +602,15 @@ with open('$MIGRATION_TEMP_DIR/subgraph_version.tsv', 'r') as infile:
 
         log_info "Found subgraph_id: $subgraph_id"
 
+        log_info "Importing subgraph_version to data database..."
         cat "$MIGRATION_TEMP_DIR/subgraph_version.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.subgraph_version FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " 2>&1 | grep -v "^COPY" || log_warning "Subgraph version may already exist (ignored)"
+        " 2>&1 | grep -v "^COPY" || log_warning "Subgraph version may already exist in data DB (ignored)"
+
+        log_info "Importing subgraph_version to metadata database..."
+        cat "$MIGRATION_TEMP_DIR/subgraph_version.tsv" | psql "$TARGET_METADATA_DB" -c "
+            COPY subgraphs.subgraph_version FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
+        " 2>&1 | grep -v "^COPY" || log_warning "Subgraph version may already exist in metadata DB (ignored)"
     else
         log_info "No subgraph_version to migrate"
     fi
@@ -582,9 +625,15 @@ with open('$MIGRATION_TEMP_DIR/subgraph_version.tsv', 'r') as infile:
         " > "$MIGRATION_TEMP_DIR/subgraph.tsv"
 
         if [ -s "$MIGRATION_TEMP_DIR/subgraph.tsv" ]; then
+            log_info "Importing subgraph to data database..."
             cat "$MIGRATION_TEMP_DIR/subgraph.tsv" | psql "$TARGET_DATA_DB" -c "
                 COPY subgraphs.subgraph FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-            " 2>&1 | grep -v "^COPY" || log_warning "Subgraph entry may already exist (ignored)"
+            " 2>&1 | grep -v "^COPY" || log_warning "Subgraph entry may already exist in data DB (ignored)"
+
+            log_info "Importing subgraph to metadata database..."
+            cat "$MIGRATION_TEMP_DIR/subgraph.tsv" | psql "$TARGET_METADATA_DB" -c "
+                COPY subgraphs.subgraph FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
+            " 2>&1 | grep -v "^COPY" || log_warning "Subgraph entry may already exist in metadata DB (ignored)"
         else
             log_info "No subgraph entry found"
         fi
@@ -638,9 +687,15 @@ with open('$MIGRATION_TEMP_DIR/assignment_source.tsv', 'r') as infile, \
             row[id_index] = target_id
         writer.writerow(row)
 "
+        log_info "Importing deployment assignment to data database..."
         cat "$MIGRATION_TEMP_DIR/assignment.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.subgraph_deployment_assignment FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " 2>&1 | grep -v "^COPY" || log_warning "Deployment assignment may already exist (ignored)"
+        " 2>&1 | grep -v "^COPY" || log_warning "Deployment assignment may already exist in data DB (ignored)"
+
+        log_info "Importing deployment assignment to metadata database..."
+        cat "$MIGRATION_TEMP_DIR/assignment.tsv" | psql "$TARGET_METADATA_DB" -c "
+            COPY subgraphs.subgraph_deployment_assignment FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
+        " 2>&1 | grep -v "^COPY" || log_warning "Deployment assignment may already exist in metadata DB (ignored)"
     else
         log_info "No deployment assignment to migrate"
     fi
@@ -851,18 +906,31 @@ perform_consistency_checks() {
         log_success "All row counts verified"
     fi
 
-    # Check 5: Verify subgraph_manifest exists with correct ID
+    # Check 5: Verify subgraph_manifest exists with correct ID in both databases
     log_info "Check 5: Verifying subgraph_manifest entry..."
-    local manifest_exists=$(psql "$TARGET_DATA_DB" -t -A -c "
+
+    local manifest_exists_data=$(psql "$TARGET_DATA_DB" -t -A -c "
         SELECT COUNT(*) FROM subgraphs.subgraph_manifest
         WHERE id = $TARGET_ID;
     ")
 
-    if [[ $manifest_exists -ne 1 ]]; then
-        log_error "subgraph_manifest check failed: expected 1 entry, found $manifest_exists"
+    local manifest_exists_metadata=$(psql "$TARGET_METADATA_DB" -t -A -c "
+        SELECT COUNT(*) FROM subgraphs.subgraph_manifest
+        WHERE id = $TARGET_ID;
+    ")
+
+    if [[ $manifest_exists_data -ne 1 ]]; then
+        log_error "subgraph_manifest check failed in data DB: expected 1 entry, found $manifest_exists_data"
         checks_passed=false
     else
-        log_success "subgraph_manifest entry verified with ID $TARGET_ID"
+        log_success "subgraph_manifest entry verified in data DB with ID $TARGET_ID"
+    fi
+
+    if [[ $manifest_exists_metadata -ne 1 ]]; then
+        log_error "subgraph_manifest check failed in metadata DB: expected 1 entry, found $manifest_exists_metadata"
+        checks_passed=false
+    else
+        log_success "subgraph_manifest entry verified in metadata DB with ID $TARGET_ID"
     fi
 
     # Check 6: Verify deployment_schemas_id_seq is updated
