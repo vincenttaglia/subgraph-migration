@@ -365,14 +365,14 @@ with open('$MIGRATION_TEMP_DIR/head_source.tsv', 'r') as infile, \
 
     # First, get the column order to understand the structure
     log_info "Getting column structure for subgraphs.deployment..."
-    local deployment_columns=$(psql "$SOURCE_METADATA_DB" -t -A -c "
+    local deployment_columns=$(psql "$SOURCE_DATA_DB" -t -A -c "
         SELECT string_agg(column_name, ', ' ORDER BY ordinal_position)
         FROM information_schema.columns
         WHERE table_schema = 'subgraphs' AND table_name = 'deployment';
     ")
     log_info "Deployment table columns: $deployment_columns"
 
-    psql "$SOURCE_METADATA_DB" -c "
+    psql "$SOURCE_DATA_DB" -c "
         COPY (SELECT * FROM subgraphs.deployment WHERE subgraph = '$deployment_hash')
         TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
     " > "$MIGRATION_TEMP_DIR/deployment_source.tsv"
@@ -416,13 +416,13 @@ with open('$MIGRATION_TEMP_DIR/deployment_source.tsv', 'r') as infile, \
         log_info "Transformed deployment data:"
         cat "$MIGRATION_TEMP_DIR/deployment.tsv"
 
-        cat "$MIGRATION_TEMP_DIR/deployment.tsv" | psql "$TARGET_METADATA_DB" -c "
+        cat "$MIGRATION_TEMP_DIR/deployment.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.deployment FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
         " 2>&1 | grep -v "^COPY" || log_warning "Deployment record may already exist (ignored)"
 
         # Verify what we just inserted
         log_info "Verifying deployment record in target database..."
-        psql "$TARGET_METADATA_DB" -c "SELECT id, subgraph FROM subgraphs.deployment WHERE subgraph = '$deployment_hash';"
+        psql "$TARGET_DATA_DB" -c "SELECT id, subgraph FROM subgraphs.deployment WHERE subgraph = '$deployment_hash';"
     else
         log_info "No deployment record found (will be created by graph-node)"
     fi
