@@ -920,15 +920,6 @@ with open('$MIGRATION_TEMP_DIR/assignment_source.tsv', 'r') as infile, \
     log_success "Metadata migration completed"
 }
 
-# Function to create target schema in data database
-create_target_schema() {
-    log_info "Creating target schema '$TARGET_NAME' in data database..."
-
-    psql "$TARGET_DATA_DB" -c "CREATE SCHEMA IF NOT EXISTS $TARGET_NAME;"
-
-    log_success "Schema created"
-}
-
 # Function to get all tables in source schema
 get_source_tables() {
     local schema_name=$1
@@ -985,10 +976,8 @@ migrate_data() {
         return 0
     fi
 
-    # Create target schema
-    create_target_schema
-
     # Perform full dump (schema + data + indexes)
+    # Note: The schema will be created by pg_dump, so we don't create it manually
     migrate_schema_and_data "$SOURCE_NAME" "$TARGET_NAME"
 
     log_success "Data migration completed"
