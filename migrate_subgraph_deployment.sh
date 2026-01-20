@@ -832,105 +832,30 @@ get_source_tables() {
     log_success "Found $table_count tables in source schema"
 }
 
-# Function to migrate schema structure (tables only, no indexes)
-migrate_schema_structure() {
+# Function to migrate schema and data using full dump
+migrate_schema_and_data() {
     local source_schema=$1
     local target_schema=$2
 
-    log_info "Migrating schema structure from '$source_schema' to '$target_schema' (tables only, indexes deferred)..."
+    log_info "Performing full dump from '$source_schema' to '$target_schema' (includes schema, data, and indexes)..."
 
-    # Dump schema structure (without data, without indexes)
-    local temp_schema_file="$MIGRATION_TEMP_DIR/schema_${source_schema}.sql"
+    # Dump everything: schema structure, data, and indexes
+    local temp_dump_file="$MIGRATION_TEMP_DIR/full_dump_${source_schema}.sql"
 
     pg_dump "$SOURCE_DATA_DB" \
         --schema="$source_schema" \
-        --schema-only \
         --no-owner \
         --no-privileges \
-        --exclude-table-data='*' \
-        > "$temp_schema_file"
+        > "$temp_dump_file"
 
-    # Split the dump into two files: one for tables/constraints, one for indexes
-    # We'll extract indexes and save them for later
-    local temp_indexes_file="$MIGRATION_TEMP_DIR/indexes_${source_schema}.sql"
+    # Replace schema name in dump
+    sed -i "s/${source_schema}/${target_schema}/g" "$temp_dump_file"
 
-    # Extract CREATE INDEX statements to separate file
-    grep -i "^CREATE.*INDEX" "$temp_schema_file" > "$temp_indexes_file" || true
+    # Apply full dump to target
+    # Full dumps handle circular foreign key constraints automatically
+    psql "$TARGET_DATA_DB" -q < "$temp_dump_file"
 
-    # Remove CREATE INDEX statements from schema file
-    sed -i '/^CREATE.*INDEX/d' "$temp_schema_file"
-
-    # Replace schema name in both dumps
-    sed -i "s/${source_schema}/${target_schema}/g" "$temp_schema_file"
-    sed -i "s/${source_schema}/${target_schema}/g" "$temp_indexes_file"
-
-    # Apply schema (tables and constraints only) to target
-    psql "$TARGET_DATA_DB" -q < "$temp_schema_file"
-
-    log_success "Schema structure migrated (without indexes)"
-}
-
-# Function to migrate indexes after data is loaded
-migrate_indexes() {
-    local source_schema=$1
-    local target_schema=$2
-
-    log_info "Creating indexes on '$target_schema' (this may take a while for large tables)..."
-
-    local temp_indexes_file="$MIGRATION_TEMP_DIR/indexes_${source_schema}.sql"
-
-    if [[ ! -f "$temp_indexes_file" ]] || [[ ! -s "$temp_indexes_file" ]]; then
-        log_info "No indexes to create"
-        return 0
-    fi
-
-    # Count indexes for progress reporting
-    local index_count=$(grep -c "^CREATE" "$temp_indexes_file" || echo "0")
-    log_info "Creating $index_count indexes..."
-
-    # Apply indexes to target
-    # We use -q to reduce output, and allow errors (some indexes might already exist)
-    psql "$TARGET_DATA_DB" -q < "$temp_indexes_file" 2>&1 | grep -v "already exists" || true
-
-    log_success "Indexes created"
-}
-
-# Function to migrate table data
-migrate_table_data() {
-    local source_schema=$1
-    local target_schema=$2
-    local table=$3
-
-    log_info "Migrating data for table '$table'..."
-
-    # Get row count for progress
-    local row_count=$(psql "$SOURCE_DATA_DB" -t -A -c "
-        SELECT COUNT(*) FROM ${source_schema}.${table};
-    ")
-
-    log_info "Table has $row_count rows"
-
-    # Dump and restore data
-    pg_dump "$SOURCE_DATA_DB" \
-        --schema="$source_schema" \
-        --table="${source_schema}.${table}" \
-        --data-only \
-        --no-owner \
-        --no-privileges \
-        | sed "s/${source_schema}/${target_schema}/g" \
-        | psql "$TARGET_DATA_DB" -q
-
-    # Verify row count
-    local target_row_count=$(psql "$TARGET_DATA_DB" -t -A -c "
-        SELECT COUNT(*) FROM ${target_schema}.${table};
-    ")
-
-    if [[ $row_count -ne $target_row_count ]]; then
-        log_error "Row count mismatch for table $table: source=$row_count, target=$target_row_count"
-        return 1
-    fi
-
-    log_success "Table '$table' migrated successfully ($target_row_count rows)"
+    log_success "Full schema and data migration completed (schema, data, and indexes)"
 }
 
 # Function to migrate all data
@@ -939,7 +864,7 @@ migrate_data() {
 
     log_info "Starting data migration for deployment '$deployment_hash'..."
 
-    # Get source tables
+    # Get source tables for later verification
     if ! get_source_tables "$SOURCE_NAME"; then
         log_warning "No data to migrate"
         return 0
@@ -948,18 +873,10 @@ migrate_data() {
     # Create target schema
     create_target_schema
 
-    # Migrate schema structure (tables and constraints, but NOT indexes)
-    migrate_schema_structure "$SOURCE_NAME" "$TARGET_NAME"
-
-    # Migrate each table's data
-    while IFS= read -r table; do
-        migrate_table_data "$SOURCE_NAME" "$TARGET_NAME" "$table"
-    done <<< "$SOURCE_TABLES"
+    # Perform full dump (schema + data + indexes)
+    migrate_schema_and_data "$SOURCE_NAME" "$TARGET_NAME"
 
     log_success "Data migration completed"
-
-    # Now create indexes after all data is loaded (much faster)
-    migrate_indexes "$SOURCE_NAME" "$TARGET_NAME"
 }
 
 # Function to perform consistency checks
