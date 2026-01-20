@@ -839,21 +839,15 @@ migrate_schema_and_data() {
 
     log_info "Performing full dump from '$source_schema' to '$target_schema' (includes schema, data, and indexes)..."
 
-    # Dump everything: schema structure, data, and indexes
-    local temp_dump_file="$MIGRATION_TEMP_DIR/full_dump_${source_schema}.sql"
-
+    # Stream dump directly to target, replacing schema names on the fly
+    # This avoids saving hundreds of GB to disk
+    # Full dumps handle circular foreign key constraints automatically
     pg_dump "$SOURCE_DATA_DB" \
         --schema="$source_schema" \
         --no-owner \
         --no-privileges \
-        > "$temp_dump_file"
-
-    # Replace schema name in dump
-    sed -i "s/${source_schema}/${target_schema}/g" "$temp_dump_file"
-
-    # Apply full dump to target
-    # Full dumps handle circular foreign key constraints automatically
-    psql "$TARGET_DATA_DB" -q < "$temp_dump_file"
+        | sed "s/${source_schema}/${target_schema}/g" \
+        | psql "$TARGET_DATA_DB" -q
 
     log_success "Full schema and data migration completed (schema, data, and indexes)"
 }
