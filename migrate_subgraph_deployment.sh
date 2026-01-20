@@ -9,18 +9,23 @@
 # Usage: ./migrate_subgraph_deployment.sh <deployment_hash>
 #
 # Environment Variables Required:
-#   SOURCE_METADATA_DB - Source metadata database connection string
-#   SOURCE_DATA_DB     - Source data database connection string
 #   TARGET_METADATA_DB - Target metadata database connection string
 #   TARGET_DATA_DB     - Target data database connection string
 #
-# Optional Environment Variables:
+# Optional Environment Variables (Source DB Configuration):
+#   SOURCE_METADATA_DB - Source metadata database connection string
+#                        If not set, will be derived from GRAPH_NODE_CONFIG
+#   SOURCE_DATA_DB     - Source data database connection string
+#                        If not set, will be derived from GRAPH_NODE_CONFIG
+#   GRAPH_NODE_CONFIG  - Path to graph-node config file
+#                        Required if SOURCE_METADATA_DB/SOURCE_DATA_DB not provided
+#                        Used to auto-detect source databases and for graphman pause/resume
+#
+# Other Optional Environment Variables:
 #   OVERRIDE_SHARD     - Override the shard value for the target deployment
 #                        (defaults to source shard if not set)
 #   TEMP_DIR           - Override the temporary directory for migration files
 #                        (defaults to /tmp/subgraph_migration_$$)
-#   GRAPH_NODE_CONFIG  - Path to graph-node config file for graphman commands
-#                        If set, runs graphman pause before and resume after migration
 ################################################################################
 
 set -euo pipefail
@@ -49,13 +54,108 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# Function to parse TOML config and extract database connection
+# Args: $1 = config file path, $2 = key to extract (e.g., "primary", "shard_name")
+parse_toml_postgres_url() {
+    local config_file=$1
+    local shard_key=$2
+
+    # Parse TOML to find the postgres connection URL for the given shard
+    # This looks for [store.primary] or [store.SHARD_NAME] sections
+    python3 - "$config_file" "$shard_key" <<'PYTHON_SCRIPT'
+import sys
+import re
+
+config_file = sys.argv[1]
+shard_key = sys.argv[2]
+
+try:
+    with open(config_file, 'r') as f:
+        content = f.read()
+
+    # Find the section [store.SHARD_KEY] or [store.primary]
+    # Match section like [store.primary] or [store."shard-name"]
+    section_pattern = rf'\[store\.{re.escape(shard_key)}\]|\[store\."{re.escape(shard_key)}"\]'
+    section_match = re.search(section_pattern, content, re.IGNORECASE)
+
+    if not section_match:
+        sys.exit(1)
+
+    # Get content after the matched section until next section or EOF
+    section_start = section_match.end()
+    next_section = re.search(r'\n\[', content[section_start:])
+    if next_section:
+        section_content = content[section_start:section_start + next_section.start()]
+    else:
+        section_content = content[section_start:]
+
+    # Find connection string - match both connection = "..." and postgres_url = "..."
+    conn_match = re.search(r'(?:connection|postgres_url)\s*=\s*["\']([^"\']+)["\']', section_content)
+    if conn_match:
+        print(conn_match.group(1), end='')
+        sys.exit(0)
+
+    sys.exit(1)
+except Exception as e:
+    print(f"Error parsing config: {e}", file=sys.stderr)
+    sys.exit(1)
+PYTHON_SCRIPT
+}
+
+# Function to derive source databases from graph-node config
+derive_source_databases() {
+    local deployment_hash=$1
+
+    log_info "Deriving source databases from graph-node config..."
+
+    # Get primary connection for metadata queries
+    local primary_conn=$(parse_toml_postgres_url "$GRAPH_NODE_CONFIG" "primary")
+    if [[ -z "$primary_conn" ]]; then
+        log_error "Could not find primary database connection in config"
+        exit 1
+    fi
+
+    # If SOURCE_METADATA_DB not set, use primary
+    if [[ -z "${SOURCE_METADATA_DB:-}" ]]; then
+        export SOURCE_METADATA_DB="$primary_conn"
+        log_info "Using primary database as SOURCE_METADATA_DB"
+    fi
+
+    # Query the shard for this deployment from metadata
+    local shard_name=$(psql "$SOURCE_METADATA_DB" -t -A -c "
+        SELECT shard
+        FROM deployment_schemas
+        WHERE subgraph = '$deployment_hash' AND active = true
+        LIMIT 1;
+    " 2>/dev/null)
+
+    if [[ -z "$shard_name" ]]; then
+        log_error "Could not determine shard for deployment '$deployment_hash' from metadata database"
+        exit 1
+    fi
+
+    log_info "Deployment is on shard: $shard_name"
+
+    # If SOURCE_DATA_DB not set, look up shard connection from config
+    if [[ -z "${SOURCE_DATA_DB:-}" ]]; then
+        local shard_conn=$(parse_toml_postgres_url "$GRAPH_NODE_CONFIG" "$shard_name")
+        if [[ -z "$shard_conn" ]]; then
+            log_error "Could not find database connection for shard '$shard_name' in config"
+            exit 1
+        fi
+
+        export SOURCE_DATA_DB="$shard_conn"
+        log_info "Using shard '$shard_name' database as SOURCE_DATA_DB"
+    fi
+
+    log_success "Source databases derived from config"
+}
+
 # Function to check required environment variables
 check_environment() {
     log_info "Checking environment variables..."
 
     local required_vars=(
-        "SOURCE_METADATA_DB"
-        "SOURCE_DATA_DB"
         "TARGET_METADATA_DB"
         "TARGET_DATA_DB"
     )
@@ -76,7 +176,28 @@ check_environment() {
         exit 1
     fi
 
-    log_success "All required environment variables are set"
+    # Check if source databases need to be derived
+    if [[ -z "${SOURCE_METADATA_DB:-}" ]] || [[ -z "${SOURCE_DATA_DB:-}" ]]; then
+        log_info "Source database(s) not provided, will derive from GRAPH_NODE_CONFIG"
+
+        # Verify GRAPH_NODE_CONFIG is available for derivation
+        if [[ -z "${GRAPH_NODE_CONFIG:-}" ]]; then
+            log_error "Either SOURCE_METADATA_DB/SOURCE_DATA_DB or GRAPH_NODE_CONFIG must be provided"
+            echo ""
+            echo "You must provide either:"
+            echo "  1. Both SOURCE_METADATA_DB and SOURCE_DATA_DB environment variables, OR"
+            echo "  2. GRAPH_NODE_CONFIG environment variable (will auto-detect source databases)"
+            echo ""
+            exit 1
+        fi
+
+        if [[ ! -f "$GRAPH_NODE_CONFIG" ]]; then
+            log_error "Graph node config file not found: $GRAPH_NODE_CONFIG"
+            exit 1
+        fi
+    else
+        log_success "All required environment variables are set"
+    fi
 }
 
 # Function to setup temporary directory
@@ -1061,6 +1182,12 @@ main() {
 
     # Pre-flight checks
     check_environment
+
+    # Derive source databases from config if not provided
+    if [[ -z "${SOURCE_METADATA_DB:-}" ]] || [[ -z "${SOURCE_DATA_DB:-}" ]]; then
+        derive_source_databases "$deployment_hash"
+    fi
+
     validate_connectivity
     setup_temp_dir
     check_deployment_exists "$deployment_hash"
