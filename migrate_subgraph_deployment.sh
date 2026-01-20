@@ -393,12 +393,12 @@ migrate_metadata() {
                 log_info "Importing graph_node_version to data database..."
                 cat "$MIGRATION_TEMP_DIR/graph_node_versions.tsv" | psql "$TARGET_DATA_DB" -c "
                     COPY subgraphs.graph_node_versions FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-                " 2>&1 | grep -v "^COPY" || true
+                " > /dev/null 2>&1 || true
 
                 log_info "Importing graph_node_version to metadata database..."
                 cat "$MIGRATION_TEMP_DIR/graph_node_versions.tsv" | psql "$TARGET_METADATA_DB" -c "
                     COPY subgraphs.graph_node_versions FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-                " 2>&1 | grep -v "^COPY" || true
+                " > /dev/null 2>&1 || true
 
                 log_info "Graph node version $version_id migrated"
             else
@@ -436,12 +436,12 @@ with open('$MIGRATION_TEMP_DIR/head_source.tsv', 'r') as infile, \
         log_info "Importing head to data database..."
         cat "$MIGRATION_TEMP_DIR/head.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.head FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " 2>&1 | grep -v "^COPY" || log_info "Head record already exists in data DB (ignored)"
+        " > /dev/null 2>&1 || log_info "Head record already exists in data DB (ignored)"
 
         log_info "Importing head to metadata database..."
         cat "$MIGRATION_TEMP_DIR/head.tsv" | psql "$TARGET_METADATA_DB" -c "
             COPY subgraphs.head FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " 2>&1 | grep -v "^COPY" || log_info "Head record already exists in metadata DB (ignored)"
+        " > /dev/null 2>&1 || log_info "Head record already exists in metadata DB (ignored)"
     else
         log_info "No head record found (will be created by graph-node)"
     fi
@@ -505,12 +505,12 @@ with open('$MIGRATION_TEMP_DIR/deployment_source.tsv', 'r') as infile, \
         log_info "Importing deployment to data database..."
         cat "$MIGRATION_TEMP_DIR/deployment.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.deployment FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " 2>&1 | grep -v "^COPY" || log_warning "Deployment record may already exist in data DB (ignored)"
+        " > /dev/null 2>&1 || log_warning "Deployment record may already exist in data DB (ignored)"
 
         log_info "Importing deployment to metadata database..."
         cat "$MIGRATION_TEMP_DIR/deployment.tsv" | psql "$TARGET_METADATA_DB" -c "
             COPY subgraphs.deployment FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " 2>&1 | grep -v "^COPY" || log_warning "Deployment record may already exist in metadata DB (ignored)"
+        " > /dev/null 2>&1 || log_warning "Deployment record may already exist in metadata DB (ignored)"
 
         # Verify what we just inserted
         log_info "Verifying deployment record in target databases..."
@@ -580,12 +580,12 @@ with open('$MIGRATION_TEMP_DIR/manifest_source.tsv', 'r') as infile, \
         log_info "Importing manifest to data database..."
         cat "$MIGRATION_TEMP_DIR/manifest.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.subgraph_manifest FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " 2>&1 | grep -v "^COPY" || log_warning "Manifest may already exist in data DB (ignored)"
+        " > /dev/null 2>&1 || log_warning "Manifest may already exist in data DB (ignored)"
 
         log_info "Importing manifest to metadata database..."
         cat "$MIGRATION_TEMP_DIR/manifest.tsv" | psql "$TARGET_METADATA_DB" -c "
             COPY subgraphs.subgraph_manifest FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " 2>&1 | grep -v "^COPY" || log_warning "Manifest may already exist in metadata DB (ignored)"
+        " > /dev/null 2>&1 || log_warning "Manifest may already exist in metadata DB (ignored)"
     else
         log_warning "No manifest data found for deployment"
     fi
@@ -602,12 +602,12 @@ with open('$MIGRATION_TEMP_DIR/manifest_source.tsv', 'r') as infile, \
         log_info "Importing errors to data database..."
         cat "$MIGRATION_TEMP_DIR/errors.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.subgraph_error FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " 2>&1 | grep -v "^COPY" || log_warning "Some errors may already exist in data DB (ignored)"
+        " > /dev/null 2>&1 || log_warning "Some errors may already exist in data DB (ignored)"
 
         log_info "Importing errors to metadata database..."
         cat "$MIGRATION_TEMP_DIR/errors.tsv" | psql "$TARGET_METADATA_DB" -c "
             COPY subgraphs.subgraph_error FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " 2>&1 | grep -v "^COPY" || log_warning "Some errors may already exist in metadata DB (ignored)"
+        " > /dev/null 2>&1 || log_warning "Some errors may already exist in metadata DB (ignored)"
     else
         log_info "No subgraph errors to migrate"
     fi
@@ -624,12 +624,12 @@ with open('$MIGRATION_TEMP_DIR/manifest_source.tsv', 'r') as infile, \
         log_info "Importing features to data database..."
         cat "$MIGRATION_TEMP_DIR/features.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.subgraph_features FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " 2>&1 | grep -v "^COPY" || log_warning "Some features may already exist in data DB (ignored)"
+        " > /dev/null 2>&1 || log_warning "Some features may already exist in data DB (ignored)"
 
         log_info "Importing features to metadata database..."
         cat "$MIGRATION_TEMP_DIR/features.tsv" | psql "$TARGET_METADATA_DB" -c "
             COPY subgraphs.subgraph_features FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " 2>&1 | grep -v "^COPY" || log_warning "Some features may already exist in metadata DB (ignored)"
+        " > /dev/null 2>&1 || log_warning "Some features may already exist in metadata DB (ignored)"
     else
         log_info "No subgraph features to migrate"
     fi
@@ -646,12 +646,12 @@ with open('$MIGRATION_TEMP_DIR/manifest_source.tsv', 'r') as infile, \
         log_info "Importing dynamic sources to data database..."
         cat "$MIGRATION_TEMP_DIR/dynamic_sources.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.dynamic_ethereum_contract_data_source FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " 2>&1 | grep -v "^COPY" || log_warning "Some dynamic sources may already exist in data DB (ignored)"
+        " > /dev/null 2>&1 || log_warning "Some dynamic sources may already exist in data DB (ignored)"
 
         log_info "Importing dynamic sources to metadata database..."
         cat "$MIGRATION_TEMP_DIR/dynamic_sources.tsv" | psql "$TARGET_METADATA_DB" -c "
             COPY subgraphs.dynamic_ethereum_contract_data_source FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " 2>&1 | grep -v "^COPY" || log_warning "Some dynamic sources may already exist in metadata DB (ignored)"
+        " > /dev/null 2>&1 || log_warning "Some dynamic sources may already exist in metadata DB (ignored)"
     else
         log_info "No dynamic data sources to migrate"
     fi
@@ -701,12 +701,12 @@ with open('$MIGRATION_TEMP_DIR/subgraph_version.tsv', 'r') as infile:
         log_info "Importing subgraph_version to data database..."
         cat "$MIGRATION_TEMP_DIR/subgraph_version.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.subgraph_version FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " 2>&1 | grep -v "^COPY" || log_warning "Subgraph version may already exist in data DB (ignored)"
+        " > /dev/null 2>&1 || log_warning "Subgraph version may already exist in data DB (ignored)"
 
         log_info "Importing subgraph_version to metadata database..."
         cat "$MIGRATION_TEMP_DIR/subgraph_version.tsv" | psql "$TARGET_METADATA_DB" -c "
             COPY subgraphs.subgraph_version FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " 2>&1 | grep -v "^COPY" || log_warning "Subgraph version may already exist in metadata DB (ignored)"
+        " > /dev/null 2>&1 || log_warning "Subgraph version may already exist in metadata DB (ignored)"
     else
         log_info "No subgraph_version to migrate"
     fi
@@ -724,12 +724,12 @@ with open('$MIGRATION_TEMP_DIR/subgraph_version.tsv', 'r') as infile:
             log_info "Importing subgraph to data database..."
             cat "$MIGRATION_TEMP_DIR/subgraph.tsv" | psql "$TARGET_DATA_DB" -c "
                 COPY subgraphs.subgraph FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-            " 2>&1 | grep -v "^COPY" || log_warning "Subgraph entry may already exist in data DB (ignored)"
+            " > /dev/null 2>&1 || log_warning "Subgraph entry may already exist in data DB (ignored)"
 
             log_info "Importing subgraph to metadata database..."
             cat "$MIGRATION_TEMP_DIR/subgraph.tsv" | psql "$TARGET_METADATA_DB" -c "
                 COPY subgraphs.subgraph FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-            " 2>&1 | grep -v "^COPY" || log_warning "Subgraph entry may already exist in metadata DB (ignored)"
+            " > /dev/null 2>&1 || log_warning "Subgraph entry may already exist in metadata DB (ignored)"
         else
             log_info "No subgraph entry found"
         fi
@@ -786,12 +786,12 @@ with open('$MIGRATION_TEMP_DIR/assignment_source.tsv', 'r') as infile, \
         log_info "Importing deployment assignment to data database..."
         cat "$MIGRATION_TEMP_DIR/assignment.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.subgraph_deployment_assignment FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " 2>&1 | grep -v "^COPY" || log_warning "Deployment assignment may already exist in data DB (ignored)"
+        " > /dev/null 2>&1 || log_warning "Deployment assignment may already exist in data DB (ignored)"
 
         log_info "Importing deployment assignment to metadata database..."
         cat "$MIGRATION_TEMP_DIR/assignment.tsv" | psql "$TARGET_METADATA_DB" -c "
             COPY subgraphs.subgraph_deployment_assignment FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " 2>&1 | grep -v "^COPY" || log_warning "Deployment assignment may already exist in metadata DB (ignored)"
+        " > /dev/null 2>&1 || log_warning "Deployment assignment may already exist in metadata DB (ignored)"
     else
         log_info "No deployment assignment to migrate"
     fi
