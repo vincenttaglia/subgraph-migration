@@ -956,12 +956,10 @@ migrate_schema_and_data() {
         # Get approximate size of schema for progress estimation
         log_info "Estimating schema size for progress monitoring..."
         local schema_size=$(psql "$SOURCE_DATA_DB" -t -A -c "
-            SELECT pg_size_pretty(pg_total_relation_size(schemaname || '.' || tablename)::bigint) as size,
-                   sum(pg_total_relation_size(schemaname || '.' || tablename)::bigint) as bytes
+            SELECT sum(pg_total_relation_size(schemaname || '.' || tablename)::bigint)
             FROM pg_tables
             WHERE schemaname = '$source_schema'
-            GROUP BY ()
-        " | cut -d'|' -f2)
+        ")
 
         if [[ -n "$schema_size" ]] && [[ "$schema_size" -gt 0 ]]; then
             local size_pretty=$(psql "$SOURCE_DATA_DB" -t -A -c "
