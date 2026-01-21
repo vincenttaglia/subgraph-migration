@@ -697,16 +697,11 @@ with open('$MIGRATION_TEMP_DIR/manifest_source.tsv', 'r') as infile, \
         head -c 200 "$MIGRATION_TEMP_DIR/manifest.tsv"
         echo ""
 
-        # Import to both metadata and data databases
+        # Import to data database only (metadata DB doesn't need manifest - graphman doesn't manage it there)
         log_info "Importing manifest to data database..."
         cat "$MIGRATION_TEMP_DIR/manifest.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.subgraph_manifest FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
         " > /dev/null 2>&1 || log_warning "Manifest may already exist in data DB (ignored)"
-
-        log_info "Importing manifest to metadata database..."
-        cat "$MIGRATION_TEMP_DIR/manifest.tsv" | psql "$TARGET_METADATA_DB" -c "
-            COPY subgraphs.subgraph_manifest FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " > /dev/null 2>&1 || log_warning "Manifest may already exist in metadata DB (ignored)"
     else
         log_warning "No manifest data found for deployment"
     fi
@@ -1101,15 +1096,10 @@ perform_consistency_checks() {
         log_success "All row counts verified"
     fi
 
-    # Check 5: Verify subgraph_manifest exists with correct ID in both databases
+    # Check 5: Verify subgraph_manifest exists with correct ID in data DB
     log_info "Check 5: Verifying subgraph_manifest entry..."
 
     local manifest_exists_data=$(psql "$TARGET_DATA_DB" -t -A -c "
-        SELECT COUNT(*) FROM subgraphs.subgraph_manifest
-        WHERE id = $TARGET_ID;
-    ")
-
-    local manifest_exists_metadata=$(psql "$TARGET_METADATA_DB" -t -A -c "
         SELECT COUNT(*) FROM subgraphs.subgraph_manifest
         WHERE id = $TARGET_ID;
     ")
@@ -1119,13 +1109,6 @@ perform_consistency_checks() {
         checks_passed=false
     else
         log_success "subgraph_manifest entry verified in data DB with ID $TARGET_ID"
-    fi
-
-    if [[ $manifest_exists_metadata -ne 1 ]]; then
-        log_error "subgraph_manifest check failed in metadata DB: expected 1 entry, found $manifest_exists_metadata"
-        checks_passed=false
-    else
-        log_success "subgraph_manifest entry verified in metadata DB with ID $TARGET_ID"
     fi
 
     # Check 6: Verify deployment_schemas_id_seq is updated
