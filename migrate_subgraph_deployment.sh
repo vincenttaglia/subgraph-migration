@@ -623,20 +623,15 @@ with open('$MIGRATION_TEMP_DIR/deployment_source.tsv', 'r') as infile, \
         log_info "Transformed deployment data:"
         cat "$MIGRATION_TEMP_DIR/deployment.tsv"
 
+        # Import to data database only (metadata DB doesn't need deployment record - graphman doesn't manage it there)
         log_info "Importing deployment to data database..."
         cat "$MIGRATION_TEMP_DIR/deployment.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.deployment FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
         " > /dev/null 2>&1 || log_warning "Deployment record may already exist in data DB (ignored)"
 
-        log_info "Importing deployment to metadata database..."
-        cat "$MIGRATION_TEMP_DIR/deployment.tsv" | psql "$TARGET_METADATA_DB" -c "
-            COPY subgraphs.deployment FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " > /dev/null 2>&1 || log_warning "Deployment record may already exist in metadata DB (ignored)"
-
         # Verify what we just inserted
-        log_info "Verifying deployment record in target databases..."
+        log_info "Verifying deployment record in target data database..."
         psql "$TARGET_DATA_DB" -c "SELECT id, subgraph FROM subgraphs.deployment WHERE subgraph = '$deployment_hash';"
-        psql "$TARGET_METADATA_DB" -c "SELECT id, subgraph FROM subgraphs.deployment WHERE subgraph = '$deployment_hash';"
     else
         log_info "No deployment record found (will be created by graph-node)"
     fi
@@ -715,15 +710,11 @@ with open('$MIGRATION_TEMP_DIR/manifest_source.tsv', 'r') as infile, \
     " > "$MIGRATION_TEMP_DIR/errors.tsv"
 
     if [ -s "$MIGRATION_TEMP_DIR/errors.tsv" ]; then
+        # Import to data database only (metadata DB doesn't need errors - graphman doesn't manage them there)
         log_info "Importing errors to data database..."
         cat "$MIGRATION_TEMP_DIR/errors.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.subgraph_error FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
         " > /dev/null 2>&1 || log_warning "Some errors may already exist in data DB (ignored)"
-
-        log_info "Importing errors to metadata database..."
-        cat "$MIGRATION_TEMP_DIR/errors.tsv" | psql "$TARGET_METADATA_DB" -c "
-            COPY subgraphs.subgraph_error FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " > /dev/null 2>&1 || log_warning "Some errors may already exist in metadata DB (ignored)"
     else
         log_info "No subgraph errors to migrate"
     fi
@@ -814,11 +805,7 @@ with open('$MIGRATION_TEMP_DIR/subgraph_version.tsv', 'r') as infile:
 
         log_info "Found subgraph_id: $subgraph_id"
 
-        log_info "Importing subgraph_version to data database..."
-        cat "$MIGRATION_TEMP_DIR/subgraph_version.tsv" | psql "$TARGET_DATA_DB" -c "
-            COPY subgraphs.subgraph_version FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " > /dev/null 2>&1 || log_warning "Subgraph version may already exist in data DB (ignored)"
-
+        # Import to metadata database only (data DB doesn't need subgraph_version - graphman doesn't manage it there)
         log_info "Importing subgraph_version to metadata database..."
         cat "$MIGRATION_TEMP_DIR/subgraph_version.tsv" | psql "$TARGET_METADATA_DB" -c "
             COPY subgraphs.subgraph_version FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
@@ -837,11 +824,7 @@ with open('$MIGRATION_TEMP_DIR/subgraph_version.tsv', 'r') as infile:
         " > "$MIGRATION_TEMP_DIR/subgraph.tsv"
 
         if [ -s "$MIGRATION_TEMP_DIR/subgraph.tsv" ]; then
-            log_info "Importing subgraph to data database..."
-            cat "$MIGRATION_TEMP_DIR/subgraph.tsv" | psql "$TARGET_DATA_DB" -c "
-                COPY subgraphs.subgraph FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-            " > /dev/null 2>&1 || log_warning "Subgraph entry may already exist in data DB (ignored)"
-
+            # Import to metadata database only (data DB doesn't need subgraph entry - graphman doesn't manage it there)
             log_info "Importing subgraph to metadata database..."
             cat "$MIGRATION_TEMP_DIR/subgraph.tsv" | psql "$TARGET_METADATA_DB" -c "
                 COPY subgraphs.subgraph FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
