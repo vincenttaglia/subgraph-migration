@@ -1266,14 +1266,12 @@ main() {
     if perform_consistency_checks "$deployment_hash"; then
         generate_summary "$deployment_hash"
         log_success "Migration completed successfully!"
-        # Resume source subgraph after successful checks
-        resume_subgraph "$SOURCE_NAME"
+        # Resume will happen via EXIT trap
         exit 0
     else
         log_error "Migration completed with consistency check failures"
         log_warning "Please review the errors above and verify the migration manually"
-        # Resume source subgraph even on failure, but after checks complete
-        resume_subgraph "$SOURCE_NAME"
+        # Resume will happen via EXIT trap
         exit 1
     fi
 }
