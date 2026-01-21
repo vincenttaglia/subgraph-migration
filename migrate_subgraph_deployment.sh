@@ -931,42 +931,16 @@ migrate_schema_and_data() {
 
     # Check if pv is available for progress monitoring
     if command -v pv &> /dev/null; then
-        # Get approximate size of schema for progress estimation
-        log_info "Estimating schema size for progress monitoring..."
-        local schema_size=$(psql "$SOURCE_DATA_DB" -t -A -c "
-            SELECT sum(pg_total_relation_size(schemaname || '.' || tablename)::bigint)
-            FROM pg_tables
-            WHERE schemaname = '$source_schema'
-        ")
+        log_info "Using pv for progress monitoring (throughput will be shown)"
 
-        if [[ -n "$schema_size" ]] && [[ "$schema_size" -gt 0 ]]; then
-            local size_pretty=$(psql "$SOURCE_DATA_DB" -t -A -c "
-                SELECT pg_size_pretty(sum(pg_total_relation_size(schemaname || '.' || tablename)::bigint))
-                FROM pg_tables
-                WHERE schemaname = '$source_schema'
-            ")
-            log_info "Schema size: $size_pretty (estimated, includes indexes)"
-            log_info "Using pv for progress monitoring (throughput and ETA will be shown)"
-
-            # Stream dump with progress monitoring and size hint
-            pg_dump "$SOURCE_DATA_DB" \
-                --schema="$source_schema" \
-                --no-owner \
-                --no-privileges \
-                | pv -pterb -s "$schema_size" \
-                | sed "s/${source_schema}/${target_schema}/g" \
-                | psql "$TARGET_DATA_DB" -q
-        else
-            log_info "Could not estimate schema size, showing throughput only"
-            # Stream dump with progress monitoring (no size)
-            pg_dump "$SOURCE_DATA_DB" \
-                --schema="$source_schema" \
-                --no-owner \
-                --no-privileges \
-                | pv -pterb \
-                | sed "s/${source_schema}/${target_schema}/g" \
-                | psql "$TARGET_DATA_DB" -q
-        fi
+        # Stream dump with progress monitoring (throughput only, no size estimate)
+        pg_dump "$SOURCE_DATA_DB" \
+            --schema="$source_schema" \
+            --no-owner \
+            --no-privileges \
+            | pv -pterb \
+            | sed "s/${source_schema}/${target_schema}/g" \
+            | psql "$TARGET_DATA_DB" -q
     else
         log_info "pv not installed - no progress monitoring available (install with: apt-get install pv)"
         # Stream dump directly to target, replacing schema names on the fly
