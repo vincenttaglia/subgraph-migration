@@ -1,115 +1,76 @@
 # Subgraph Deployment Migration Script
 
-A comprehensive bash script for migrating specific subgraph deployments from one Graph Node database cluster to another.
+A bash script for migrating specific subgraph deployments from one Graph Node database cluster to another.
 
 ## Overview
 
 This script handles the complete migration of subgraph deployments between sharded database clusters, including:
 
 - Metadata migration (deployment_schemas, subgraph tables)
-- Data schema migration (sgdXXX schemas and all tables)
+- Data schema migration (sgdXXX schemas with all tables and indexes)
 - Automatic ID sequence management
 - Data consistency verification
-- Support for separate metadata and data databases
+- Streaming data transfer (no intermediate disk storage required)
+- Optional graphman integration for pausing/resuming subgraphs
 
 ## Prerequisites
 
 - PostgreSQL client tools (`psql`, `pg_dump`)
 - Appropriate database permissions for reading and writing
 - Network connectivity to all database instances
-- Sufficient disk space in `/tmp` for temporary export files
+- `pv` (optional, for progress monitoring during data transfer)
 
 ## Database Structure
 
 The script works with Graph Node's sharded architecture:
 
-- **Metadata Database**: Contains `deployment_schemas`, `subgraphs.subgraph_manifest`, `subgraphs.subgraph_deployment`, and related metadata tables
-- **Data Database**: Contains the actual subgraph data in schemas named `sgdXXX` where XXX corresponds to the `id` in `deployment_schemas`
+- **Metadata Database**: Contains `deployment_schemas`, `subgraphs.subgraph_version`, `subgraphs.subgraph`, and coordination tables
+- **Data Database**: Contains the actual subgraph data in schemas named `sgdXXX`, plus `subgraphs.deployment`, `subgraphs.subgraph_manifest`, and `subgraphs.subgraph_error`
 
 ## Setup
 
 ### Configure Environment Variables
 
-Set the following required environment variables with your database connection strings:
+**Required** environment variables:
 
 ```bash
-export SOURCE_METADATA_DB="postgresql://user:password@source-host:5432/graph-metadata"
-export SOURCE_DATA_DB="postgresql://user:password@source-host:5432/graph-data"
 export TARGET_METADATA_DB="postgresql://user:password@target-host:5432/graph-metadata"
 export TARGET_DATA_DB="postgresql://user:password@target-host:5432/graph-data"
 ```
 
-Connection string format:
+**Source database configuration** (one of the following):
+
+Option 1 - Use GRAPH_NODE_CONFIG (recommended):
+```bash
+export GRAPH_NODE_CONFIG="/path/to/graph-node-config.toml"
 ```
-postgresql://[user[:password]@][host][:port][/dbname][?param1=value1&...]
+The script will automatically derive source databases from the config file based on where the deployment is located. It will also pause the source subgraph before migration using graphman and resume it after completion (or on failure).
+
+**Note**: The `graphman` command is known to segfault after successfully completing operations. The script handles this gracefully and continues execution.
+
+Option 2 - Explicit source databases:
+```bash
+export SOURCE_METADATA_DB="postgresql://user:password@source-host:5432/graph-metadata"
+export SOURCE_DATA_DB="postgresql://user:password@source-host:5432/graph-data"
 ```
 
-#### Optional Environment Variables
+### Optional Environment Variables
 
 **OVERRIDE_SHARD**: Override the shard value for the target deployment
 
-By default, the script preserves the shard value from the source deployment. If you need to migrate a deployment to a different shard in the target database, set this variable:
+By default, the script preserves the shard value from the source deployment. If you need to migrate a deployment to a shard with a different name:
 
 ```bash
 export OVERRIDE_SHARD="shard2"
 ```
 
-This is useful when:
-- Rebalancing deployments across shards
-- Migrating to a cluster with different shard naming conventions
-- Moving deployments to specific shards for performance optimization
+**TEMP_DIR**: Override the temporary directory for small metadata files
 
-Example:
-```bash
-# Migrate deployment from "primary" shard to "shard2"
-export OVERRIDE_SHARD="shard2"
-./migrate_subgraph_deployment.sh QmYg7FibZJJDvS4PZu8kXF5iCkCqGH7PjCPjXP8gZiH5J5
-```
-
-**TEMP_DIR**: Override the temporary directory for migration files
-
-By default, the script creates temporary files in `/tmp/subgraph_migration_$$` (where `$$` is the process ID). You can override this to use a different location:
+The script uses temporary files only for metadata records (small). Data is streamed directly without intermediate storage.
 
 ```bash
 export TEMP_DIR="/var/lib/migrations/temp"
 ```
-
-This is useful when:
-- `/tmp` has limited disk space and you have large deployments
-- You need to use a faster disk for temporary files (e.g., SSD vs HDD)
-- You want to preserve temporary files for debugging (disable cleanup trap)
-- Your system has `/tmp` mounted with `noexec` flag
-
-Example:
-```bash
-# Use a custom temp directory with more space
-export TEMP_DIR="/mnt/large-disk/migration-temp"
-./migrate_subgraph_deployment.sh QmYg7FibZJJDvS4PZu8kXF5iCkCqGH7PjCPjXP8gZiH5J5
-```
-
-**Note**: The script automatically creates the temp directory if it doesn't exist and cleans it up when the migration completes (or fails).
-
-**GRAPH_NODE_CONFIG**: Path to graph-node config file for graphman pause/resume
-
-If set, the script will pause the source subgraph before migration and resume it after completion (or on failure):
-
-```bash
-export GRAPH_NODE_CONFIG="/path/to/graph-node-config.toml"
-```
-
-This is useful when:
-- You want to ensure the source subgraph is not actively indexing during migration
-- You need to prevent write conflicts during the migration process
-- You want to safely migrate a deployment that's actively running
-
-Example:
-```bash
-# Pause subgraph during migration
-export GRAPH_NODE_CONFIG="/etc/graph-node/config.toml"
-./migrate_subgraph_deployment.sh QmYg7FibZJJDvS4PZu8kXF5iCkCqGH7PjCPjXP8gZiH5J5
-```
-
-**Note**: The `graphman` command is known to segfault after successfully completing operations. The script handles this gracefully and continues execution. The subgraph will be automatically resumed even if the migration fails.
 
 ## Usage
 
@@ -131,8 +92,8 @@ export GRAPH_NODE_CONFIG="/etc/graph-node/config.toml"
 
 ### 1. Pre-flight Checks
 
-- Validates all required environment variables are set
-- Tests connectivity to all four databases
+- Validates required environment variables
+- Tests connectivity to all databases
 - Verifies the deployment exists in the source and is active
 - Confirms the deployment doesn't already exist in the target
 
@@ -144,36 +105,43 @@ export GRAPH_NODE_CONFIG="/etc/graph-node/config.toml"
 
 ### 3. Metadata Migration
 
-Migrates the following tables from source to target metadata database:
+Migrates coordination tables:
 
 - `deployment_schemas` - with new ID and schema name
-- `subgraphs.subgraph_manifest` - deployment manifest and configuration (with new ID matching deployment_schemas)
-- `subgraphs.deployment` - deployment state and sync status
-- `subgraphs.subgraph_error` - any error records
+- `subgraphs.subgraph_version` - version records (metadata DB only)
+- `subgraphs.subgraph` - subgraph entry (metadata DB only)
+- `subgraphs.subgraph_deployment_assignment` - node assignments
+
+Migrates data-related metadata:
+
+- `subgraphs.deployment` - deployment state and sync status (data DB only)
+- `subgraphs.subgraph_manifest` - deployment manifest and configuration (data DB only)
+- `subgraphs.subgraph_error` - any error records (data DB only)
+- `subgraphs.subgraph_head` - block head tracking
+- `subgraphs.graph_node_versions` - version tracking
 - `subgraphs.dynamic_ethereum_contract_data_source` - dynamic data sources
 
 ### 4. Data Migration
 
-- Creates the new schema in the target data database
-- Migrates the schema structure (tables and constraints, **indexes deferred**)
-- Copies all data from each table without index maintenance overhead
-- Creates indexes after all data is loaded (much faster for large tables)
-- Verifies row counts match for each table
+- Streams the entire schema (tables, data, and indexes) via `pg_dump | psql`
+- No intermediate disk storage required - data flows directly between databases
+- Schema name is transformed on-the-fly during streaming
+- Progress monitoring available with `pv` (shows throughput)
 
 ### 5. Consistency Checks
 
-Performs comprehensive validation:
+Performs validation:
 
 1. Verifies `deployment_schemas` entry exists with correct information
 2. Confirms schema exists in target data database
 3. Validates table count matches between source and target
 4. Verifies row counts for all tables
-5. Confirms `subgraph_manifest` entry exists
+5. Confirms `subgraph_manifest` entry exists in data DB
 6. Validates `deployment_schemas_id_seq` was properly incremented
 
 ### 6. Summary Report
 
-Generates a detailed summary of the migration including:
+Generates a summary including:
 
 - Deployment hash
 - Source and target schema names
@@ -183,17 +151,16 @@ Generates a detailed summary of the migration including:
 
 ## Important Notes
 
-### ID Sequence Management
+### Streaming Data Transfer
 
-The script automatically:
-- Calls `nextval('deployment_schemas_id_seq')` to get the next ID
-- Uses this ID for the new deployment_schemas entry
-- Generates the schema name as `sgd<ID>`
-- The sequence is automatically incremented by the `nextval()` call
+Data is streamed directly from source to target using `pg_dump | psql`. This means:
+- No disk space required for data (only small metadata temp files)
+- Migration of very large deployments (hundreds of GB) is supported
+- Network bandwidth is the primary bottleneck
 
 ### Active Deployments Only
 
-The script only migrates deployments marked as `active = true` in the source `deployment_schemas` table. This ensures you're migrating the current active version.
+The script only migrates deployments marked as `active = true` in the source `deployment_schemas` table.
 
 ### Schema Name Mapping
 
@@ -201,20 +168,6 @@ The script only migrates deployments marked as `active = true` in the source `de
 - **Target**: `sgd<target_id>` (e.g., `sgd123`)
 
 All references to the schema name are automatically updated during migration.
-
-### Transaction Safety
-
-- Metadata migration is wrapped in a transaction
-- If metadata migration fails, it will roll back
-- Data migration uses `pg_dump`/`psql` which handles its own consistency
-
-### Temporary Files
-
-The script creates temporary files during migration:
-- Default location: `/tmp/subgraph_migration_<PID>`
-- Can be overridden with `TEMP_DIR` environment variable
-- Automatically cleaned up on completion or failure (via EXIT trap)
-- Ensure sufficient disk space in the temp directory (especially for large deployments)
 
 ### Rollback Considerations
 
@@ -225,10 +178,11 @@ This script does NOT automatically rollback on failure. If migration fails partw
    ```sql
    -- On target metadata database
    DELETE FROM deployment_schemas WHERE subgraph = '<deployment_hash>';
-   DELETE FROM subgraphs.subgraph_manifest WHERE id = <target_id>;
-   DELETE FROM subgraphs.deployment WHERE deployment = '<deployment_hash>';
+   DELETE FROM subgraphs.subgraph_version WHERE deployment = '<deployment_hash>';
 
    -- On target data database
+   DELETE FROM subgraphs.subgraph_manifest WHERE id = <target_id>;
+   DELETE FROM subgraphs.deployment WHERE id = <target_id>;
    DROP SCHEMA IF EXISTS sgd<target_id> CASCADE;
    ```
 
@@ -240,7 +194,6 @@ If you get connection errors:
 - Verify the connection strings are correct
 - Check network connectivity: `psql <connection_string> -c "SELECT 1;"`
 - Ensure firewall rules allow connections
-- Verify SSL/TLS settings if required
 
 ### Permission Denied
 
@@ -254,9 +207,8 @@ Ensure your database user has:
 
 If consistency checks report row count mismatches:
 1. Check for concurrent writes to source during migration
-2. Verify no triggers or constraints prevented data insertion
+2. Consider using graphman to pause the subgraph during migration
 3. Check PostgreSQL logs for errors
-4. Re-run the migration on an idle source
 
 ### Deployment Already Exists
 
@@ -276,6 +228,7 @@ The deployment was already migrated. To re-migrate:
 - **Consistency checks**: Validates the migration was successful
 - **Non-destructive**: Never modifies or deletes source data
 - **Duplicate prevention**: Won't migrate if deployment already exists in target
+- **Auto-resume**: Automatically resumes paused subgraph on completion or failure
 
 ## Performance Considerations
 
@@ -283,211 +236,37 @@ Migration time depends on:
 - Size of the subgraph data
 - Network bandwidth between source and target
 - Database server performance
-- Number of tables and indexes
 
-### Index Optimization
+### Progress Monitoring
 
-The script automatically optimizes index handling for faster migrations:
+If `pv` is installed, the script displays real-time throughput during data transfer:
+```
+32.6MiB 0:00:01 [31.7MiB/s]
+```
 
-1. **During schema migration**: Creates tables and constraints, but **defers index creation**
-2. **During data copy**: No index maintenance overhead, allowing maximum throughput
-3. **After data load**: Builds all indexes at once on complete tables (much faster than incremental updates)
+Install with: `apt-get install pv`
 
-This optimization can **dramatically speed up large table migrations** (potentially 10x+ faster for heavily indexed tables).
+### Large Deployments
 
-### Large Deployments (>100GB)
-
-For large deployments:
-- Expect most migration time in data copy and index creation phases
-- Network throughput during COPY will be high (hundreds of Mbps)
-- Disk writes may be bursty due to PostgreSQL checkpoint behavior
-- Index creation phase may take significant time but shows steady progress
+For large deployments (100GB+):
+- Data streams directly without disk storage requirements
+- Network throughput is the primary factor
 - Consider running during low-traffic periods
-- Monitor disk space on target
-- Use connection pooling if available
+- Monitor disk space on target for the final data
 
-## Example Session
+## Batch Migration
 
-```bash
-$ export SOURCE_METADATA_DB="postgresql://graph@source-db:5432/graph"
-$ export SOURCE_DATA_DB="postgresql://graph@source-db:5432/graph"
-$ export TARGET_METADATA_DB="postgresql://graph@target-db:5432/graph"
-$ export TARGET_DATA_DB="postgresql://graph@target-db:5432/graph"
-
-$ ./migrate_subgraph_deployment.sh QmYg7FibZJJDvS4PZu8kXF5iCkCqGH7PjCPjXP8gZiH5J5
-
-========================================
-Subgraph Deployment Migration Tool
-========================================
-
-[INFO] Checking environment variables...
-[SUCCESS] All required environment variables are set
-[INFO] Validating database connectivity...
-[SUCCESS] All database connections validated
-[INFO] Using default temp directory: /tmp/subgraph_migration_12345
-[SUCCESS] Temp directory created
-[INFO] Checking if deployment 'QmYg7...' exists in source...
-[SUCCESS] Deployment found in source database
-[INFO] Checking if deployment already exists in target...
-[SUCCESS] Deployment does not exist in target (safe to proceed)
-[INFO] Retrieving deployment information from source...
-[SUCCESS] Retrieved deployment info: schema=sgd42, shard=primary, network=mainnet
-[INFO] Getting next deployment_schemas ID for target...
-[SUCCESS] Next deployment ID: 123
-[INFO] Generating target schema name...
-[SUCCESS] Target schema name: sgd123
-[INFO] Determining target shard...
-[SUCCESS] Using source shard: primary
-
-[WARNING] About to migrate deployment:
-  Deployment:    QmYg7FibZJJDvS4PZu8kXF5iCkCqGH7PjCPjXP8gZiH5J5
-  Source Schema: sgd42 (ID: 42)
-  Target Schema: sgd123 (ID: 123)
-  Source Shard:  primary
-  Target Shard:  primary
-
-Proceed with migration? (y/N): y
-
-[INFO] Starting migration...
-[INFO] Migrating metadata for deployment 'QmYg7...'
-[INFO] Inserting into deployment_schemas...
-[INFO] Migrating subgraph_manifest...
-[INFO] Migrating subgraph_deployment...
-[INFO] Migrating subgraph_error records...
-[INFO] Migrating dynamic ethereum contract data sources...
-[SUCCESS] Metadata migration completed
-[INFO] Starting data migration for deployment 'QmYg7...'
-[INFO] Retrieving table list from source schema 'sgd42'...
-[SUCCESS] Found 15 tables in source schema
-[INFO] Creating target schema 'sgd123' in data database...
-[SUCCESS] Schema created
-[INFO] Migrating schema structure from 'sgd42' to 'sgd123'...
-[SUCCESS] Schema structure migrated
-[INFO] Migrating data for table 'poi2$'...
-[INFO] Table has 50000 rows
-[SUCCESS] Table 'poi2$' migrated successfully (50000 rows)
-[INFO] Migrating data for table 'transfer'...
-[INFO] Table has 1000000 rows
-[SUCCESS] Table 'transfer' migrated successfully (1000000 rows)
-...
-[SUCCESS] Data migration completed
-
-[INFO] Performing data consistency checks...
-[INFO] Check 1: Verifying deployment_schemas entry...
-[SUCCESS] deployment_schemas entry verified
-[INFO] Check 2: Verifying schema exists in data database...
-[SUCCESS] Schema exists in data database
-[INFO] Check 3: Verifying table count...
-[SUCCESS] Table count verified: 15 tables
-[INFO] Check 4: Verifying row counts for all tables...
-[INFO] Table 'poi2$': 50000 rows verified
-[INFO] Table 'transfer': 1000000 rows verified
-...
-[SUCCESS] All row counts verified
-[INFO] Check 5: Verifying subgraph_manifest entry...
-[SUCCESS] subgraph_manifest entry verified
-[INFO] Check 6: Verifying deployment_schemas_id_seq...
-[SUCCESS] Sequence verified: current value is 123
-
-[SUCCESS] All consistency checks passed!
-
-========================================
-Migration Summary
-========================================
-Deployment Hash:    QmYg7FibZJJDvS4PZu8kXF5iCkCqGH7PjCPjXP8gZiH5J5
-Source Schema:      sgd42
-Target Schema:      sgd123
-Source ID:          42
-Target ID:          123
-Network:            mainnet
-Source Shard:       primary
-Target Shard:       primary
-
-Tables Migrated:    15
-
-Tables:
-  - poi2$
-  - transfer
-  - token
-  - account
-  ...
-========================================
-
-[INFO] Cleaning up temporary files...
-[SUCCESS] Temp directory cleaned up
-
-[SUCCESS] Migration completed successfully!
-```
-
-## Advanced Usage
-
-### Migrating Multiple Deployments
-
-Create a wrapper script to migrate multiple deployments:
+For migrating multiple deployments, use the included batch script:
 
 ```bash
-#!/bin/bash
-
-deployments=(
-    "QmYg7FibZJJDvS4PZu8kXF5iCkCqGH7PjCPjXP8gZiH5J5"
-    "QmXYZ123..."
-    "QmABC456..."
-)
-
-for deployment in "${deployments[@]}"; do
-    echo "Migrating $deployment..."
-    ./migrate_subgraph_deployment.sh "$deployment"
-    if [ $? -eq 0 ]; then
-        echo "✓ $deployment migrated successfully"
-    else
-        echo "✗ $deployment migration failed"
-        exit 1
-    fi
-done
+./batch_migrate.sh deployment_list.txt
 ```
 
-### Migrating to Different Shards
+Where `deployment_list.txt` contains one deployment hash per line. Multiple instances with different ENV variables can be run in the same working directory without issue.
 
-You can migrate deployments to specific shards using the `OVERRIDE_SHARD` environment variable:
-
-```bash
-#!/bin/bash
-
-# Migrate deployments to different shards for load balancing
-export OVERRIDE_SHARD="shard1"
-./migrate_subgraph_deployment.sh QmYg7FibZJJDvS4PZu8kXF5iCkCqGH7PjCPjXP8gZiH5J5
-
-export OVERRIDE_SHARD="shard2"
-./migrate_subgraph_deployment.sh QmXYZ123...
-
-export OVERRIDE_SHARD="shard3"
-./migrate_subgraph_deployment.sh QmABC456...
-
-# Or migrate all to the same shard
-export OVERRIDE_SHARD="primary"
-for deployment in "${deployments[@]}"; do
-    ./migrate_subgraph_deployment.sh "$deployment"
-done
-```
-
-### Dry Run Mode
-
-To test without making changes, you can modify the script to add a `DRY_RUN` variable at the top:
-
-```bash
-DRY_RUN=true  # Set to false for actual migration
-```
-
-Then wrap all write operations in conditionals.
-
-## Support
+## Troubleshooting
 
 For issues or questions:
 1. Check the troubleshooting section above
 2. Review the consistency check output for specific failures
 3. Examine PostgreSQL logs on both source and target
-4. Verify the Graph Node schema documentation: https://github.com/graphprotocol/graph-node
-
-## License
-
-This script is provided as-is for use with Graph Node database migrations.
