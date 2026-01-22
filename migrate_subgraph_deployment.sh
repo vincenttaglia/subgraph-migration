@@ -694,9 +694,10 @@ with open('$MIGRATION_TEMP_DIR/manifest_source.tsv', 'r') as infile, \
 
         # Import to data database only (metadata DB doesn't need manifest - graphman doesn't manage it there)
         log_info "Importing manifest to data database..."
-        cat "$MIGRATION_TEMP_DIR/manifest.tsv" | psql "$TARGET_DATA_DB" -c "
+        local manifest_error=""
+        manifest_error=$(cat "$MIGRATION_TEMP_DIR/manifest.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.subgraph_manifest FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " > /dev/null 2>&1 || log_warning "Manifest may already exist in data DB (ignored)"
+        " 2>&1) || log_warning "Manifest import failed: $manifest_error"
     else
         log_warning "No manifest data found for deployment"
     fi
