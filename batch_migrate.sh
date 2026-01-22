@@ -18,6 +18,10 @@
 #   - SOURCE_METADATA_DB, SOURCE_DATA_DB, GRAPH_NODE_CONFIG (optional)
 #   - OVERRIDE_SHARD (optional)
 #
+# Controls:
+#   - Press Ctrl+D to gracefully stop after the current migration(s) complete
+#   - The script will log the stopping point for easy resumption
+#
 # Notes:
 #   - Empty lines and lines starting with # are ignored
 #   - Failed migrations are logged but don't stop the batch
@@ -130,12 +134,65 @@ mkdir -p "$RESULTS_DIR"
 log_info "Batch ID: $BATCH_ID"
 log_info "Results directory: $RESULTS_DIR"
 
+# Stop flag file for graceful shutdown
+STOP_FLAG="$RESULTS_DIR/.stop_requested"
+
 # Export environment variables for child processes
 export MIGRATION_SCRIPT
 export RESULTS_DIR
 export BATCH_ID
+export STOP_FLAG
 
-# Function to run a single migration (used by xargs)
+# Function to check if stop was requested
+check_stop_requested() {
+    [[ -f "$STOP_FLAG" ]]
+}
+
+# Function to write stop information
+write_stop_info() {
+    local current_index=$1
+    local current_hash=$2
+    local stop_file="$RESULTS_DIR/stopped_at.txt"
+
+    {
+        echo "Batch migration stopped by user (Ctrl+D)"
+        echo ""
+        echo "Stopped at:"
+        echo "  Index: $current_index of $TOTAL_HASHES"
+        echo "  Last hash processed: $current_hash"
+        echo "  Timestamp: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo ""
+        echo "To resume, create a new hash file with remaining deployments:"
+        echo "  tail -n +$((current_index + 1)) '$HASH_FILE' > remaining_hashes.txt"
+        echo "  ./batch_migrate.sh remaining_hashes.txt"
+    } > "$stop_file"
+
+    log_warning "Stop information written to: $stop_file"
+}
+
+# Background process to watch for Ctrl+D (EOF on stdin)
+watch_for_stop() {
+    # Read stdin until EOF (Ctrl+D)
+    cat > /dev/null 2>&1
+    # When EOF received, create stop flag
+    touch "$STOP_FLAG"
+    echo ""
+    log_warning "Stop requested (Ctrl+D). Will stop after current migration(s) complete..."
+}
+
+# Start the background watcher
+watch_for_stop &
+WATCHER_PID=$!
+
+# Cleanup function to kill watcher on exit
+cleanup_watcher() {
+    if kill -0 "$WATCHER_PID" 2>/dev/null; then
+        kill "$WATCHER_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup_watcher EXIT
+
+# Function to run a single migration
 run_migration() {
     local hash="$1"
     local log_file="$RESULTS_DIR/${hash}.log"
@@ -162,13 +219,63 @@ run_migration() {
 }
 export -f run_migration
 
-# Run migrations using xargs
-# Filter out comments and empty lines, then pipe to xargs
+# Run migrations
 log_info "Starting batch migration..."
+log_info "Press Ctrl+D to stop after current migration(s) complete"
 echo ""
 
-grep -v '^\s*#' "$HASH_FILE" | grep -v '^\s*$' | \
-    xargs -P "$PARALLELISM" -I {} bash -c 'run_migration "{}"' || true
+# Read hashes into array (filter comments and empty lines)
+mapfile -t HASHES < <(grep -v '^\s*#' "$HASH_FILE" | grep -v '^\s*$')
+
+CURRENT_INDEX=0
+STOPPED=false
+LAST_HASH=""
+
+if [[ $PARALLELISM -eq 1 ]]; then
+    # Sequential execution with stop checking between each migration
+    for hash in "${HASHES[@]}"; do
+        CURRENT_INDEX=$((CURRENT_INDEX + 1))
+        LAST_HASH="$hash"
+
+        # Check if stop was requested before starting next migration
+        if check_stop_requested; then
+            STOPPED=true
+            log_warning "Stopping batch migration as requested"
+            write_stop_info "$((CURRENT_INDEX - 1))" "${HASHES[$((CURRENT_INDEX - 2))]:-none}"
+            break
+        fi
+
+        run_migration "$hash" || true
+    done
+else
+    # Parallel execution - process in batches and check stop flag between batches
+    while [[ $CURRENT_INDEX -lt ${#HASHES[@]} ]]; do
+        # Check if stop was requested
+        if check_stop_requested; then
+            STOPPED=true
+            log_warning "Stopping batch migration as requested"
+            write_stop_info "$CURRENT_INDEX" "$LAST_HASH"
+            break
+        fi
+
+        # Get next batch of hashes
+        BATCH_END=$((CURRENT_INDEX + PARALLELISM))
+        if [[ $BATCH_END -gt ${#HASHES[@]} ]]; then
+            BATCH_END=${#HASHES[@]}
+        fi
+
+        # Run batch in parallel
+        for ((i=CURRENT_INDEX; i<BATCH_END; i++)); do
+            LAST_HASH="${HASHES[$i]}"
+            run_migration "${HASHES[$i]}" &
+        done
+
+        # Wait for batch to complete
+        wait
+
+        CURRENT_INDEX=$BATCH_END
+    done
+fi
 
 # Generate summary
 echo ""
@@ -179,6 +286,7 @@ echo ""
 
 SUCCESS_COUNT=0
 FAILED_COUNT=0
+REMAINING_COUNT=0
 
 if [[ -f "$RESULTS_DIR/success.txt" ]]; then
     SUCCESS_COUNT=$(wc -l < "$RESULTS_DIR/success.txt")
@@ -188,7 +296,11 @@ if [[ -f "$RESULTS_DIR/failed.txt" ]]; then
     FAILED_COUNT=$(wc -l < "$RESULTS_DIR/failed.txt")
 fi
 
+PROCESSED_COUNT=$((SUCCESS_COUNT + FAILED_COUNT))
+REMAINING_COUNT=$((TOTAL_HASHES - PROCESSED_COUNT))
+
 log_info "Total deployments: $TOTAL_HASHES"
+log_info "Processed: $PROCESSED_COUNT"
 log_success "Successful: $SUCCESS_COUNT"
 
 if [[ $FAILED_COUNT -gt 0 ]]; then
@@ -200,13 +312,22 @@ else
     log_info "Failed: 0"
 fi
 
+if [[ "$STOPPED" == "true" ]]; then
+    echo ""
+    log_warning "Batch was stopped early by user (Ctrl+D)"
+    log_warning "Remaining: $REMAINING_COUNT deployments not processed"
+    log_info "See $RESULTS_DIR/stopped_at.txt for resume instructions"
+fi
+
 echo ""
 log_info "Detailed logs available in: $RESULTS_DIR"
 echo ""
 
-# Exit with error if any migrations failed
-if [[ $FAILED_COUNT -gt 0 ]]; then
-    exit 1
+# Exit with appropriate code
+if [[ "$STOPPED" == "true" ]]; then
+    exit 2  # Stopped by user
+elif [[ $FAILED_COUNT -gt 0 ]]; then
+    exit 1  # Some migrations failed
 fi
 
 exit 0
