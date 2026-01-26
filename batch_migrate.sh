@@ -180,13 +180,20 @@ watch_for_stop() {
     log_warning "Stop requested (Ctrl+D). Will stop after current migration(s) complete..."
 }
 
-# Start the background watcher
-watch_for_stop &
-WATCHER_PID=$!
+# Start the background watcher only if stdin is a terminal
+# Otherwise, in non-interactive contexts, stdin is already at EOF
+if [[ -t 0 ]]; then
+    watch_for_stop &
+    WATCHER_PID=$!
+else
+    WATCHER_PID=""
+    log_warning "Running in non-interactive mode. Ctrl+D graceful stop is disabled."
+    log_info "To stop, use: touch '$STOP_FLAG'"
+fi
 
 # Cleanup function to kill watcher on exit
 cleanup_watcher() {
-    if kill -0 "$WATCHER_PID" 2>/dev/null; then
+    if [[ -n "$WATCHER_PID" ]] && kill -0 "$WATCHER_PID" 2>/dev/null; then
         kill "$WATCHER_PID" 2>/dev/null || true
     fi
 }
