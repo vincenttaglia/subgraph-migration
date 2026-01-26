@@ -54,6 +54,47 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# Helper function to check if a psql error is a duplicate key violation (safe to ignore)
+# Returns 0 if it's a duplicate key error, 1 otherwise
+is_duplicate_key_error() {
+    local error_msg="$1"
+    if [[ "$error_msg" == *"duplicate key"* ]] || [[ "$error_msg" == *"already exists"* ]] || [[ "$error_msg" == *"unique constraint"* ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Helper function to import a record with proper error handling
+# Usage: import_record_safe <description> <tsv_file> <db_connection> <table_name> <critical>
+# If critical=true, exits on non-duplicate errors; if critical=false, just warns
+import_record_safe() {
+    local description="$1"
+    local tsv_file="$2"
+    local db_connection="$3"
+    local table_name="$4"
+    local critical="${5:-false}"
+
+    local import_error=""
+    if ! import_error=$(cat "$tsv_file" | psql "$db_connection" -c "
+        COPY $table_name FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
+    " 2>&1); then
+        if is_duplicate_key_error "$import_error"; then
+            log_info "$description already exists (skipped)"
+            return 0
+        else
+            if [[ "$critical" == "true" ]]; then
+                log_error "$description import failed: $import_error"
+                exit 1
+            else
+                log_warning "$description import failed: $import_error"
+                return 1
+            fi
+        fi
+    fi
+    log_success "$description imported"
+    return 0
+}
+
 # Function to parse TOML config and extract database connection
 # Args: $1 = config file path, $2 = key to extract (e.g., "primary", "shard_name")
 parse_toml_postgres_url() {
@@ -572,15 +613,8 @@ with open('$MIGRATION_TEMP_DIR/head_source.tsv', 'r') as infile, \
             row[0] = target_id  # Replace ID unconditionally
         writer.writerow(row)
 "
-        log_info "Importing head to data database..."
-        cat "$MIGRATION_TEMP_DIR/head.tsv" | psql "$TARGET_DATA_DB" -c "
-            COPY subgraphs.head FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " > /dev/null 2>&1 || log_info "Head record already exists in data DB (ignored)"
-
-        log_info "Importing head to metadata database..."
-        cat "$MIGRATION_TEMP_DIR/head.tsv" | psql "$TARGET_METADATA_DB" -c "
-            COPY subgraphs.head FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " > /dev/null 2>&1 || log_info "Head record already exists in metadata DB (ignored)"
+        import_record_safe "Head record (data DB)" "$MIGRATION_TEMP_DIR/head.tsv" "$TARGET_DATA_DB" "subgraphs.head" "true"
+        import_record_safe "Head record (metadata DB)" "$MIGRATION_TEMP_DIR/head.tsv" "$TARGET_METADATA_DB" "subgraphs.head" "false"
     else
         log_info "No head record found (will be created by graph-node)"
     fi
@@ -642,10 +676,8 @@ with open('$MIGRATION_TEMP_DIR/deployment_source.tsv', 'r') as infile, \
         cat "$MIGRATION_TEMP_DIR/deployment.tsv"
 
         # Import to data database only (metadata DB doesn't need deployment record - graphman doesn't manage it there)
-        log_info "Importing deployment to data database..."
-        cat "$MIGRATION_TEMP_DIR/deployment.tsv" | psql "$TARGET_DATA_DB" -c "
-            COPY subgraphs.deployment FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " > /dev/null 2>&1 || log_warning "Deployment record may already exist in data DB (ignored)"
+        # This is critical - manifest FK depends on this record
+        import_record_safe "Deployment record (data DB)" "$MIGRATION_TEMP_DIR/deployment.tsv" "$TARGET_DATA_DB" "subgraphs.deployment" "true"
 
         # Verify what we just inserted
         log_info "Verifying deployment record in target data database..."
@@ -843,10 +875,8 @@ with open('$MIGRATION_TEMP_DIR/subgraph_version.tsv', 'r') as infile:
         log_info "Found subgraph_id: $subgraph_id"
 
         # Import to metadata database only (data DB doesn't need subgraph_version - graphman doesn't manage it there)
-        log_info "Importing subgraph_version to metadata database..."
-        cat "$MIGRATION_TEMP_DIR/subgraph_version.tsv" | psql "$TARGET_METADATA_DB" -c "
-            COPY subgraphs.subgraph_version FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " > /dev/null 2>&1 || log_warning "Subgraph version may already exist in metadata DB (ignored)"
+        # This is important for subgraph routing/discovery
+        import_record_safe "Subgraph version (metadata DB)" "$MIGRATION_TEMP_DIR/subgraph_version.tsv" "$TARGET_METADATA_DB" "subgraphs.subgraph_version" "true"
     else
         log_info "No subgraph_version to migrate"
     fi
@@ -862,10 +892,8 @@ with open('$MIGRATION_TEMP_DIR/subgraph_version.tsv', 'r') as infile:
 
         if [ -s "$MIGRATION_TEMP_DIR/subgraph.tsv" ]; then
             # Import to metadata database only (data DB doesn't need subgraph entry - graphman doesn't manage it there)
-            log_info "Importing subgraph to metadata database..."
-            cat "$MIGRATION_TEMP_DIR/subgraph.tsv" | psql "$TARGET_METADATA_DB" -c "
-                COPY subgraphs.subgraph FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-            " > /dev/null 2>&1 || log_warning "Subgraph entry may already exist in metadata DB (ignored)"
+            # This is important - subgraph_version references this record
+            import_record_safe "Subgraph entry (metadata DB)" "$MIGRATION_TEMP_DIR/subgraph.tsv" "$TARGET_METADATA_DB" "subgraphs.subgraph" "true"
         else
             log_info "No subgraph entry found"
         fi
@@ -919,15 +947,9 @@ with open('$MIGRATION_TEMP_DIR/assignment_source.tsv', 'r') as infile, \
             row[id_index] = target_id
         writer.writerow(row)
 "
-        log_info "Importing deployment assignment to data database..."
-        cat "$MIGRATION_TEMP_DIR/assignment.tsv" | psql "$TARGET_DATA_DB" -c "
-            COPY subgraphs.subgraph_deployment_assignment FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " > /dev/null 2>&1 || log_warning "Deployment assignment may already exist in data DB (ignored)"
-
-        log_info "Importing deployment assignment to metadata database..."
-        cat "$MIGRATION_TEMP_DIR/assignment.tsv" | psql "$TARGET_METADATA_DB" -c "
-            COPY subgraphs.subgraph_deployment_assignment FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " > /dev/null 2>&1 || log_warning "Deployment assignment may already exist in metadata DB (ignored)"
+        # Deployment assignment is critical - determines which node runs the subgraph
+        import_record_safe "Deployment assignment (data DB)" "$MIGRATION_TEMP_DIR/assignment.tsv" "$TARGET_DATA_DB" "subgraphs.subgraph_deployment_assignment" "true"
+        import_record_safe "Deployment assignment (metadata DB)" "$MIGRATION_TEMP_DIR/assignment.tsv" "$TARGET_METADATA_DB" "subgraphs.subgraph_deployment_assignment" "true"
     else
         log_info "No deployment assignment to migrate"
     fi
