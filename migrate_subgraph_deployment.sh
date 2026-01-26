@@ -443,24 +443,13 @@ migrate_metadata() {
 
     log_info "Migrating metadata for deployment '$deployment_hash'..."
 
-    # Insert into deployment_schemas with new ID and schema name
-    log_info "Inserting into deployment_schemas..."
-    psql "$TARGET_METADATA_DB" -c "
-        INSERT INTO deployment_schemas (id, created_at, subgraph, name, shard, version, network, active)
-        VALUES (
-            $TARGET_ID,
-            '$SOURCE_CREATED_AT',
-            '$SOURCE_SUBGRAPH',
-            '$TARGET_NAME',
-            '$TARGET_SHARD',
-            '$SOURCE_VERSION',
-            '$SOURCE_NETWORK',
-            '$SOURCE_ACTIVE'
-        );
-    "
-
-    # Migrate graph_node_versions (if referenced by manifest and not already in target)
-    log_info "Migrating graph_node_versions..."
+    # ============================================================================
+    # STEP 1: Resolve graph_node_versions FIRST (fail fast before creating records)
+    # ============================================================================
+    # This must happen before any other imports because:
+    # 1. If the version exists with a different ID, we need to know the correct ID for manifest
+    # 2. If import fails, we want to fail before creating deployment_schemas/etc
+    log_info "Resolving graph_node_versions..."
 
     # Get the version ID needed by this deployment (with error handling)
     local version_id=""
@@ -541,7 +530,27 @@ migrate_metadata() {
         export TARGET_GRAPH_NODE_VERSION_ID=""
     fi
 
-    # Migrate subgraphs.head (required by deployment FK)
+    # ============================================================================
+    # STEP 2: Insert deployment_schemas (registry entry)
+    # ============================================================================
+    log_info "Inserting into deployment_schemas..."
+    psql "$TARGET_METADATA_DB" -c "
+        INSERT INTO deployment_schemas (id, created_at, subgraph, name, shard, version, network, active)
+        VALUES (
+            $TARGET_ID,
+            '$SOURCE_CREATED_AT',
+            '$SOURCE_SUBGRAPH',
+            '$TARGET_NAME',
+            '$TARGET_SHARD',
+            '$SOURCE_VERSION',
+            '$SOURCE_NETWORK',
+            '$SOURCE_ACTIVE'
+        );
+    "
+
+    # ============================================================================
+    # STEP 3: Migrate subgraphs.head (required by deployment FK)
+    # ============================================================================
     log_info "Migrating subgraph head..."
 
     psql "$SOURCE_DATA_DB" -c "
