@@ -479,57 +479,66 @@ migrate_metadata() {
     if [ -n "$version_id" ] && [ "$version_id" != "" ]; then
         log_info "Found graph_node_version_id: $version_id"
 
-        # Check if this version already exists in target (check data DB)
-        local version_exists=$(psql "$TARGET_DATA_DB" -t -A -c "
-            SELECT COUNT(*) FROM subgraphs.graph_node_versions WHERE id = $version_id;
-        " 2>&1) || {
-            log_warning "Could not check if version exists in target data DB"
-            version_exists="0"
-        }
+        # Get the unique key values from source to check if version exists by content (not just ID)
+        local version_info=$(psql "$SOURCE_DATA_DB" -t -A -F'|' -c "
+            SELECT git_commit_hash, git_repository_dirty, crate_version, major, minor, patch
+            FROM subgraphs.graph_node_versions WHERE id = $version_id;
+        " 2>/dev/null)
 
-        # Also check metadata DB
-        local version_exists_metadata=$(psql "$TARGET_METADATA_DB" -t -A -c "
-            SELECT COUNT(*) FROM subgraphs.graph_node_versions WHERE id = $version_id;
-        " 2>&1) || {
-            log_warning "Could not check if version exists in target metadata DB"
-            version_exists_metadata="0"
-        }
+        if [ -n "$version_info" ]; then
+            IFS='|' read -r git_hash git_dirty crate_ver v_major v_minor v_patch <<< "$version_info"
+            log_info "Graph node version info: $crate_ver (commit: ${git_hash:0:8})"
 
-        # If exists in either, skip migration
-        if [ "$version_exists" != "0" ] || [ "$version_exists_metadata" != "0" ]; then
-            version_exists="1"
-        fi
+            # Check if this version already exists in target by unique key (not by ID)
+            # The unique constraint is on (git_commit_hash, git_repository_dirty, crate_version, major, minor, patch)
+            local existing_version_id=$(psql "$TARGET_DATA_DB" -t -A -c "
+                SELECT id FROM subgraphs.graph_node_versions
+                WHERE git_commit_hash = '$git_hash'
+                  AND git_repository_dirty = '$git_dirty'
+                  AND crate_version = '$crate_ver'
+                  AND major = $v_major AND minor = $v_minor AND patch = $v_patch;
+            " 2>/dev/null)
 
-        if [ "$version_exists" = "0" ]; then
-            log_info "Migrating graph_node_version $version_id..."
-            # Version doesn't exist, migrate it
-            psql "$SOURCE_DATA_DB" -c "
-                COPY (SELECT * FROM subgraphs.graph_node_versions WHERE id = $version_id)
-                TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-            " > "$MIGRATION_TEMP_DIR/graph_node_versions.tsv" 2>&1 || {
-                log_warning "Could not export graph_node_version"
-            }
+            # Trim whitespace
+            existing_version_id=$(echo "$existing_version_id" | xargs 2>/dev/null || echo "")
 
-            if [ -s "$MIGRATION_TEMP_DIR/graph_node_versions.tsv" ]; then
-                log_info "Importing graph_node_version to data database..."
-                cat "$MIGRATION_TEMP_DIR/graph_node_versions.tsv" | psql "$TARGET_DATA_DB" -c "
-                    COPY subgraphs.graph_node_versions FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-                " > /dev/null 2>&1 || true
-
-                log_info "Importing graph_node_version to metadata database..."
-                cat "$MIGRATION_TEMP_DIR/graph_node_versions.tsv" | psql "$TARGET_METADATA_DB" -c "
-                    COPY subgraphs.graph_node_versions FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-                " > /dev/null 2>&1 || true
-
-                log_info "Graph node version $version_id migrated"
+            if [ -n "$existing_version_id" ] && [ "$existing_version_id" != "" ]; then
+                log_info "Graph node version already exists in target with id=$existing_version_id (source id=$version_id)"
+                export TARGET_GRAPH_NODE_VERSION_ID="$existing_version_id"
             else
-                log_warning "No graph_node_version data to migrate"
+                # Version doesn't exist by unique key, migrate it with source ID
+                log_info "Migrating graph_node_version $version_id..."
+                psql "$SOURCE_DATA_DB" -c "
+                    COPY (SELECT * FROM subgraphs.graph_node_versions WHERE id = $version_id)
+                    TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
+                " > "$MIGRATION_TEMP_DIR/graph_node_versions.tsv" 2>&1 || {
+                    log_warning "Could not export graph_node_version"
+                }
+
+                if [ -s "$MIGRATION_TEMP_DIR/graph_node_versions.tsv" ]; then
+                    log_info "Importing graph_node_version to data database..."
+                    cat "$MIGRATION_TEMP_DIR/graph_node_versions.tsv" | psql "$TARGET_DATA_DB" -c "
+                        COPY subgraphs.graph_node_versions FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
+                    " || log_error "Failed to import graph_node_version to data DB"
+
+                    log_info "Importing graph_node_version to metadata database..."
+                    cat "$MIGRATION_TEMP_DIR/graph_node_versions.tsv" | psql "$TARGET_METADATA_DB" -c "
+                        COPY subgraphs.graph_node_versions FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
+                    " || log_warning "Failed to import graph_node_version to metadata DB (may already exist)"
+
+                    log_success "Graph node version $version_id migrated"
+                else
+                    log_warning "No graph_node_version data to migrate"
+                fi
+                export TARGET_GRAPH_NODE_VERSION_ID="$version_id"
             fi
         else
-            log_info "Graph node version $version_id already exists in target (skipped)"
+            log_warning "Could not retrieve graph_node_version info from source, using source ID"
+            export TARGET_GRAPH_NODE_VERSION_ID="$version_id"
         fi
     else
         log_info "No graph node version to migrate"
+        export TARGET_GRAPH_NODE_VERSION_ID=""
     fi
 
     # Migrate subgraphs.head (required by deployment FK)
@@ -660,12 +669,13 @@ with open('$MIGRATION_TEMP_DIR/deployment_source.tsv', 'r') as infile, \
         head -c 200 "$MIGRATION_TEMP_DIR/manifest_source.tsv"
         echo ""
 
-        # Replace the source ID with target ID using Python for CSV parsing
+        # Replace the source ID with target ID and graph_node_version_id using Python for CSV parsing
         python3 -c "
 import sys
 import csv
 
 target_id = '${TARGET_ID}'.strip()
+target_gv_id = '${TARGET_GRAPH_NODE_VERSION_ID}'.strip()
 columns = '${manifest_columns}'.split(', ')
 
 # Find the index of the 'id' column
@@ -675,7 +685,16 @@ except ValueError:
     print('ERROR: Could not find id column in manifest table', file=sys.stderr)
     sys.exit(1)
 
+# Find the index of the 'graph_node_version_id' column
+try:
+    gv_index = columns.index('graph_node_version_id')
+except ValueError:
+    print('WARNING: Could not find graph_node_version_id column in manifest table', file=sys.stderr)
+    gv_index = -1
+
 print(f'DEBUG: Manifest ID column is at index {id_index}', file=sys.stderr)
+if gv_index >= 0:
+    print(f'DEBUG: graph_node_version_id column is at index {gv_index}', file=sys.stderr)
 
 with open('$MIGRATION_TEMP_DIR/manifest_source.tsv', 'r') as infile, \
      open('$MIGRATION_TEMP_DIR/manifest.tsv', 'w') as outfile:
@@ -685,6 +704,9 @@ with open('$MIGRATION_TEMP_DIR/manifest_source.tsv', 'r') as infile, \
         if row and len(row) > id_index:
             print(f'DEBUG: Replacing manifest row[{id_index}]={row[id_index]} with {target_id}', file=sys.stderr)
             row[id_index] = target_id
+        if row and gv_index >= 0 and len(row) > gv_index and target_gv_id:
+            print(f'DEBUG: Replacing manifest graph_node_version_id row[{gv_index}]={row[gv_index]} with {target_gv_id}', file=sys.stderr)
+            row[gv_index] = target_gv_id
         writer.writerow(row)
 "
         # Debug: show the transformed data
@@ -695,9 +717,14 @@ with open('$MIGRATION_TEMP_DIR/manifest_source.tsv', 'r') as infile, \
         # Import to data database only (metadata DB doesn't need manifest - graphman doesn't manage it there)
         log_info "Importing manifest to data database..."
         local manifest_error=""
-        manifest_error=$(cat "$MIGRATION_TEMP_DIR/manifest.tsv" | psql "$TARGET_DATA_DB" -c "
+        if ! manifest_error=$(cat "$MIGRATION_TEMP_DIR/manifest.tsv" | psql "$TARGET_DATA_DB" -c "
             COPY subgraphs.subgraph_manifest FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " 2>&1) || log_warning "Manifest import failed: $manifest_error"
+        " 2>&1); then
+            log_error "Manifest import failed: $manifest_error"
+            log_error "This is a critical error - the subgraph will not start without a manifest record"
+            exit 1
+        fi
+        log_success "Manifest imported to data database"
     else
         log_warning "No manifest data found for deployment"
     fi
