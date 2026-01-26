@@ -171,9 +171,10 @@ write_stop_info() {
 }
 
 # Background process to watch for Ctrl+D (EOF on stdin)
+# Reads from fd 3 which is a copy of the original stdin
 watch_for_stop() {
-    # Read stdin until EOF (Ctrl+D)
-    cat > /dev/null 2>&1
+    # Read from fd 3 (original stdin) until EOF (Ctrl+D)
+    cat <&3 > /dev/null 2>&1
     # When EOF received, create stop flag
     touch "$STOP_FLAG"
     echo ""
@@ -183,6 +184,8 @@ watch_for_stop() {
 # Start the background watcher only if stdin is a terminal
 # Otherwise, in non-interactive contexts, stdin is already at EOF
 if [[ -t 0 ]]; then
+    # Save stdin to fd 3 so background process can access it
+    exec 3<&0
     watch_for_stop &
     WATCHER_PID=$!
 else
@@ -196,6 +199,8 @@ cleanup_watcher() {
     if [[ -n "$WATCHER_PID" ]] && kill -0 "$WATCHER_PID" 2>/dev/null; then
         kill "$WATCHER_PID" 2>/dev/null || true
     fi
+    # Close fd 3 if it was opened
+    exec 3<&- 2>/dev/null || true
 }
 trap cleanup_watcher EXIT
 
