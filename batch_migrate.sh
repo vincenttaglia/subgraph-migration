@@ -217,7 +217,15 @@ run_migration() {
 
     # Run migration with auto-yes for confirmation prompts
     # Set TEMP_DIR to ensure each migration uses its own temp directory
-    if yes | TEMP_DIR="$migration_temp_dir" "$MIGRATION_SCRIPT" "$hash" > "$log_file" 2>&1; then
+    # Note: We must disable pipefail and use PIPESTATUS to get the migration script's
+    # exit code. With pipefail, when yes receives SIGPIPE (migration script closes stdin),
+    # it exits non-zero, which would incorrectly mark successful migrations as failed.
+    set +o pipefail
+    yes 2>/dev/null | TEMP_DIR="$migration_temp_dir" "$MIGRATION_SCRIPT" "$hash" > "$log_file" 2>&1
+    local exit_code=${PIPESTATUS[1]}
+    set -o pipefail
+
+    if [[ $exit_code -eq 0 ]]; then
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: $hash"
         # Use flock to safely append to shared files
         flock "$RESULTS_DIR/success.lock" -c "echo '$hash' >> '$RESULTS_DIR/success.txt'"
