@@ -614,7 +614,6 @@ with open('$MIGRATION_TEMP_DIR/head_source.tsv', 'r') as infile, \
         writer.writerow(row)
 "
         import_record_safe "Head record (data DB)" "$MIGRATION_TEMP_DIR/head.tsv" "$TARGET_DATA_DB" "subgraphs.head" "true"
-        import_record_safe "Head record (metadata DB)" "$MIGRATION_TEMP_DIR/head.tsv" "$TARGET_METADATA_DB" "subgraphs.head" "false"
     else
         log_info "No head record found (will be created by graph-node)"
     fi
