@@ -603,6 +603,7 @@ migrate_metadata() {
         # Replace the source ID with target ID using Python for CSV parsing
         python3 -c "
 import csv
+csv.field_size_limit(10**9)
 target_id = '${TARGET_ID}'.strip()
 with open('$MIGRATION_TEMP_DIR/head_source.tsv', 'r') as infile, \
      open('$MIGRATION_TEMP_DIR/head.tsv', 'w') as outfile:
@@ -645,6 +646,7 @@ with open('$MIGRATION_TEMP_DIR/head_source.tsv', 'r') as infile, \
         python3 -c "
 import sys
 import csv
+csv.field_size_limit(10**9)
 
 target_id = '${TARGET_ID}'.strip()
 columns = '${deployment_columns}'.split(', ')
@@ -713,6 +715,7 @@ with open('$MIGRATION_TEMP_DIR/deployment_source.tsv', 'r') as infile, \
         python3 -c "
 import sys
 import csv
+csv.field_size_limit(10**9)
 
 target_id = '${TARGET_ID}'.strip()
 target_gv_id = '${TARGET_GRAPH_NODE_VERSION_ID}'.strip()
@@ -853,6 +856,7 @@ with open('$MIGRATION_TEMP_DIR/manifest_source.tsv', 'r') as infile, \
         subgraph_id=$(python3 -c "
 import sys
 import csv
+csv.field_size_limit(10**9)
 
 columns = '${version_columns}'.split(', ')
 
@@ -923,6 +927,7 @@ with open('$MIGRATION_TEMP_DIR/subgraph_version.tsv', 'r') as infile:
         python3 -c "
 import sys
 import csv
+csv.field_size_limit(10**9)
 
 target_id = '${TARGET_ID}'.strip()
 columns = '${assignment_columns}'.split(', ')
