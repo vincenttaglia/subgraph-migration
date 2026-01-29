@@ -24,8 +24,9 @@ This script handles the complete migration of subgraph deployments between shard
 
 The script works with Graph Node's sharded architecture:
 
-- **Metadata Database**: Contains `deployment_schemas`, `subgraphs.subgraph_version`, `subgraphs.subgraph`, and coordination tables
-- **Data Database**: Contains the actual subgraph data in schemas named `sgdXXX`, plus `subgraphs.deployment`, `subgraphs.subgraph_manifest`, and `subgraphs.subgraph_error`
+- **Metadata Database (primary)**: Contains `deployment_schemas`, `subgraphs.subgraph_version`, `subgraphs.subgraph`, and coordination tables
+- **Data Database (shard)**: Contains the actual subgraph data in schemas named `sgdXXX`, plus `subgraphs.head`, `subgraphs.deployment`, `subgraphs.subgraph_manifest`, `subgraphs.subgraph_error`, and `subgraphs.graph_node_versions`
+- **Both databases**: `subgraphs.subgraph_features`, `subgraphs.dynamic_ethereum_contract_data_source`, `subgraphs.subgraph_deployment_assignment`
 
 ## Setup
 
@@ -105,20 +106,24 @@ export TEMP_DIR="/var/lib/migrations/temp"
 
 ### 3. Metadata Migration
 
-Migrates coordination tables:
+Migrates to **metadata DB (primary) only**:
 
 - `deployment_schemas` - with new ID and schema name
-- `subgraphs.subgraph_version` - version records (metadata DB only)
-- `subgraphs.subgraph` - subgraph entry (metadata DB only)
-- `subgraphs.subgraph_deployment_assignment` - node assignments
+- `subgraphs.subgraph_version` - version records
+- `subgraphs.subgraph` - subgraph entry
 
-Migrates data-related metadata:
+Migrates to **data DB (shard) only**:
 
-- `subgraphs.deployment` - deployment state and sync status (data DB only)
-- `subgraphs.subgraph_manifest` - deployment manifest and configuration (data DB only)
-- `subgraphs.subgraph_error` - any error records (data DB only)
-- `subgraphs.subgraph_head` - block head tracking
+- `subgraphs.head` - block head tracking
+- `subgraphs.deployment` - deployment state and sync status
+- `subgraphs.subgraph_manifest` - deployment manifest and configuration
+- `subgraphs.subgraph_error` - any error records
 - `subgraphs.graph_node_versions` - version tracking
+
+Migrates to **both databases**:
+
+- `subgraphs.subgraph_deployment_assignment` - node assignments
+- `subgraphs.subgraph_features` - feature flags
 - `subgraphs.dynamic_ethereum_contract_data_source` - dynamic data sources
 
 ### 4. Data Migration
