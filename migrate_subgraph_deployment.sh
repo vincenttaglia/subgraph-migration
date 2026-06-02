@@ -1258,6 +1258,12 @@ main() {
     # Pause source subgraph if GRAPH_NODE_CONFIG is set
     pause_subgraph "$SOURCE_NAME"
 
+    # Wait for graphman pause to reach graph-nodes
+    if [[ -n "${GRAPH_NODE_CONFIG:-}" ]]; then
+        log_info "Waiting 20s for source subgraph to pause..."
+        sleep 20
+    fi
+
     # Update cleanup trap to include resume (in case of unexpected exit before consistency checks)
     trap "resume_subgraph \"$SOURCE_NAME\"; cleanup_temp_dir" EXIT
 
