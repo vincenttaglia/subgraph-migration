@@ -24,11 +24,29 @@
 # Other Optional Environment Variables:
 #   OVERRIDE_SHARD     - Override the shard value for the target deployment
 #                        (defaults to source shard if not set)
-#   TEMP_DIR           - Override the temporary directory for migration files
-#                        (defaults to /tmp/subgraph_migration_$$)
+#   TEMP_DIR           - Parent directory for migration temp files; a unique
+#                        subdirectory subgraph_migration_<pid> is created inside
+#                        it and removed on exit (defaults to /tmp)
 ################################################################################
 
 set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Connection resilience (fix #2: connect_timeout + TCP keepalives)
+# ---------------------------------------------------------------------------
+# These apply to EVERY psql invocation in this script via libpq env vars, so
+# a hung TCP connect fails fast (instead of blocking for the OS default ~2min)
+# and long-lived COPY connections get keepalive probes so a silently-dropped
+# connection is detected quickly. Both can be overridden from the environment.
+# PGOPTIONS sets server-side TCP keepalives (USERSET GUCs); the default is used
+# only when PGOPTIONS is unset. If a connection pooler (e.g. pgbouncer) rejects
+# startup options, run with PGOPTIONS='' to disable them.
+export PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-15}"
+export PGOPTIONS="${PGOPTIONS--c tcp_keepalives_idle=30 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=5}"
+
+# Retry tuning for transient connection failures (fix #3)
+PSQL_MAX_ATTEMPTS="${PSQL_MAX_ATTEMPTS:-5}"
+PSQL_RETRY_BASE_DELAY="${PSQL_RETRY_BASE_DELAY:-3}"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -64,6 +82,143 @@ is_duplicate_key_error() {
     return 1
 }
 
+# Helper function to check if a psql error is a transient connection problem
+# (safe to retry). Returns 0 if it looks transient, 1 otherwise.
+is_transient_conn_error() {
+    local error_msg="$1"
+    shopt -s nocasematch
+    local rc=1
+    # NOTE: match specific transient phrases only. Do NOT match the generic
+    # "connection to server ... failed:" prefix, since libpq also uses it for
+    # non-transient auth / pg_hba / missing-database / role errors, which must
+    # fail fast rather than burn retries.
+    if [[ "$error_msg" == *"connection timed out"* ]] \
+       || [[ "$error_msg" == *"could not connect"* ]] \
+       || [[ "$error_msg" == *"connection refused"* ]] \
+       || [[ "$error_msg" == *"connection reset"* ]] \
+       || [[ "$error_msg" == *"server closed the connection"* ]] \
+       || [[ "$error_msg" == *"could not receive data"* ]] \
+       || [[ "$error_msg" == *"could not send data"* ]] \
+       || [[ "$error_msg" == *"broken pipe"* ]] \
+       || [[ "$error_msg" == *"ssl syscall error"* ]] \
+       || [[ "$error_msg" == *"eof detected"* ]] \
+       || [[ "$error_msg" == *"connection not open"* ]] \
+       || [[ "$error_msg" == *"terminating connection"* ]] \
+       || [[ "$error_msg" == *"the database system is"* ]] \
+       || [[ "$error_msg" == *"timeout expired"* ]] \
+       || [[ "$error_msg" == *"no route to host"* ]] \
+       || [[ "$error_msg" == *"temporary failure in name resolution"* ]] \
+       || [[ "$error_msg" == *"network is unreachable"* ]]; then
+        rc=0
+    fi
+    shopt -u nocasematch
+    return $rc
+}
+
+# Run psql, retrying on transient connection failures with linear backoff.
+# On success, the command's stdout is forwarded to this function's stdout, so
+# it is a drop-in for `$(psql ...)` scalar/`-c` reads. NOT for reads whose
+# output must preserve a trailing newline or NUL bytes (use psql_to_file_retry).
+# Usage: psql_retry <psql args...>
+psql_retry() {
+    local attempt=1 rc out err errfile
+    while true; do
+        errfile=$(mktemp)
+        set +e
+        out=$(psql "$@" 2>"$errfile")
+        rc=$?
+        set -e
+        err=$(cat "$errfile"); rm -f "$errfile"
+        if [[ $rc -eq 0 ]]; then
+            printf '%s' "$out"
+            return 0
+        fi
+        if is_transient_conn_error "$err" && [[ $attempt -lt $PSQL_MAX_ATTEMPTS ]]; then
+            local delay=$(( PSQL_RETRY_BASE_DELAY * attempt ))
+            log_warning "psql transient connection failure (attempt $attempt/$PSQL_MAX_ATTEMPTS), retrying in ${delay}s: $(printf '%s' "$err" | head -1)" >&2
+            sleep "$delay"
+            attempt=$(( attempt + 1 ))
+            continue
+        fi
+        printf '%s' "$err" >&2
+        return $rc
+    done
+}
+
+# Run psql writing stdout directly to a file (no shell capture, so binary/CSV
+# COPY output is preserved exactly), retrying on transient connection failures.
+# Usage: psql_to_file_retry <out_file> <psql args...>
+psql_to_file_retry() {
+    local out_file="$1"; shift
+    local attempt=1 rc err errfile
+    while true; do
+        errfile=$(mktemp)
+        set +e
+        psql "$@" >"$out_file" 2>"$errfile"
+        rc=$?
+        set -e
+        err=$(cat "$errfile"); rm -f "$errfile"
+        if [[ $rc -eq 0 ]]; then
+            return 0
+        fi
+        if is_transient_conn_error "$err" && [[ $attempt -lt $PSQL_MAX_ATTEMPTS ]]; then
+            local delay=$(( PSQL_RETRY_BASE_DELAY * attempt ))
+            log_warning "psql export transient failure (attempt $attempt/$PSQL_MAX_ATTEMPTS), retrying in ${delay}s: $(printf '%s' "$err" | head -1)" >&2
+            sleep "$delay"
+            attempt=$(( attempt + 1 ))
+            continue
+        fi
+        # Final failure: a mid-stream disconnect may have left a partial file.
+        # Truncate it so callers' `-s` (non-empty) checks fail closed to
+        # "no data" instead of importing a truncated/corrupt export.
+        : > "$out_file"
+        printf '%s' "$err" >&2
+        return $rc
+    done
+}
+
+# Run a single SQL write statement (`-c "..."`) with transient-retry and
+# duplicate-skip semantics, for mutations that aren't COPY-from-file.
+# A duplicate key is treated as success (idempotent re-run / retry-after-commit).
+# Usage: exec_write_retry <description> <db_connection> <sql> <critical>
+exec_write_retry() {
+    local description="$1" db_connection="$2" sql="$3"
+    local critical="${4:-false}"
+    local attempt=1 out rc
+    while true; do
+        set +e
+        out=$(psql "$db_connection" -c "$sql" 2>&1)
+        rc=$?
+        set -e
+
+        if [[ $rc -eq 0 ]]; then
+            log_success "$description"
+            return 0
+        fi
+
+        if is_duplicate_key_error "$out"; then
+            log_info "$description already exists (skipped)"
+            return 0
+        fi
+
+        if is_transient_conn_error "$out" && [[ $attempt -lt $PSQL_MAX_ATTEMPTS ]]; then
+            local delay=$(( PSQL_RETRY_BASE_DELAY * attempt ))
+            log_warning "$description: transient connection failure (attempt $attempt/$PSQL_MAX_ATTEMPTS), retrying in ${delay}s"
+            sleep "$delay"
+            attempt=$(( attempt + 1 ))
+            continue
+        fi
+
+        if [[ "$critical" == "true" ]]; then
+            log_error "$description failed: $out"
+            exit 1
+        else
+            log_warning "$description failed: $out"
+            return 1
+        fi
+    done
+}
+
 # Helper function to import a record with proper error handling
 # Usage: import_record_safe <description> <tsv_file> <db_connection> <table_name> <critical>
 # If critical=true, exits on non-duplicate errors; if critical=false, just warns
@@ -74,25 +229,42 @@ import_record_safe() {
     local table_name="$4"
     local critical="${5:-false}"
 
-    local import_error=""
-    if ! import_error=$(cat "$tsv_file" | psql "$db_connection" -c "
-        COPY $table_name FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-    " 2>&1); then
+    local attempt=1 import_error rc
+    while true; do
+        # Redirect stdin from the file (not a pipe) so each retry re-reads it.
+        set +e
+        import_error=$(psql "$db_connection" -c "
+            COPY $table_name FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
+        " < "$tsv_file" 2>&1)
+        rc=$?
+        set -e
+
+        if [[ $rc -eq 0 ]]; then
+            log_success "$description imported"
+            return 0
+        fi
+
         if is_duplicate_key_error "$import_error"; then
             log_info "$description already exists (skipped)"
             return 0
-        else
-            if [[ "$critical" == "true" ]]; then
-                log_error "$description import failed: $import_error"
-                exit 1
-            else
-                log_warning "$description import failed: $import_error"
-                return 1
-            fi
         fi
-    fi
-    log_success "$description imported"
-    return 0
+
+        if is_transient_conn_error "$import_error" && [[ $attempt -lt $PSQL_MAX_ATTEMPTS ]]; then
+            local delay=$(( PSQL_RETRY_BASE_DELAY * attempt ))
+            log_warning "$description: transient connection failure (attempt $attempt/$PSQL_MAX_ATTEMPTS), retrying in ${delay}s"
+            sleep "$delay"
+            attempt=$(( attempt + 1 ))
+            continue
+        fi
+
+        if [[ "$critical" == "true" ]]; then
+            log_error "$description import failed: $import_error"
+            exit 1
+        else
+            log_warning "$description import failed: $import_error"
+            return 1
+        fi
+    done
 }
 
 # Function to parse TOML config and extract database connection
@@ -244,8 +416,10 @@ check_environment() {
 # Function to setup temporary directory
 setup_temp_dir() {
     if [[ -n "${TEMP_DIR:-}" ]]; then
-        # Use user-specified temp directory
-        export MIGRATION_TEMP_DIR="$TEMP_DIR"
+        # Use a unique subdirectory of the user-specified directory, so the
+        # EXIT-trap cleanup (rm -rf) only ever removes files this run created,
+        # never pre-existing contents of a shared directory.
+        export MIGRATION_TEMP_DIR="${TEMP_DIR%/}/subgraph_migration_$$"
         log_info "Using custom temp directory: $MIGRATION_TEMP_DIR"
     else
         # Use default temp directory with process ID
@@ -321,24 +495,174 @@ check_deployment_exists() {
     log_success "Deployment found in source database"
 }
 
-# Function to check if deployment already exists in target
+# Function to check if deployment already exists in target.
+# Checks BOTH the target metadata DB (deployment_schemas registry) and the
+# target data DB (subgraphs.deployment/head/manifest rows), since a previous
+# failed/partial run can leave rows in either. If leftovers are found, aborts
+# and prints the exact SQL needed to delete them, scoped to the ids found.
 check_deployment_not_in_target() {
     local deployment_hash=$1
 
     log_info "Checking if deployment already exists in target..."
 
-    local exists=$(psql "$TARGET_METADATA_DB" -t -A -c "
-        SELECT COUNT(*)
-        FROM deployment_schemas
-        WHERE subgraph = '$deployment_hash';
-    ")
+    # The source's own registry id: when source and target share a database
+    # (same-cluster shard migration), the source's legitimate rows must not
+    # be reported as leftovers or offered for deletion.
+    local source_reg_id
+    source_reg_id=$(psql_retry "$SOURCE_METADATA_DB" -t -A -c "
+        SELECT id FROM deployment_schemas
+        WHERE subgraph = '$deployment_hash' AND active = true
+        LIMIT 1;" 2>/dev/null || true)
+    # Only ever use it as a numeric id; anything else (error text, empty) is discarded.
+    [[ "$source_reg_id" =~ ^[0-9]+$ ]] || source_reg_id=""
 
-    if [[ $exists -gt 0 ]]; then
-        log_error "Deployment '$deployment_hash' already exists in target database"
-        exit 1
+    # In the shared-DB case, restrict to active rows: inactive rows for this hash
+    # are pre-existing source history, not leftovers from a failed migration
+    # (this script only ever inserts active rows).
+    local meta_filter="" data_filter=""
+    if [[ "$TARGET_METADATA_DB" == "$SOURCE_METADATA_DB" && -n "$source_reg_id" ]]; then
+        meta_filter="AND active = true AND id <> $source_reg_id"
+    fi
+    if [[ "$TARGET_DATA_DB" == "$SOURCE_DATA_DB" && -n "$source_reg_id" ]]; then
+        data_filter="AND id <> $source_reg_id"
     fi
 
-    log_success "Deployment does not exist in target (safe to proceed)"
+    # Registry rows in the target metadata DB
+    local meta_rows
+    meta_rows=$(psql_retry "$TARGET_METADATA_DB" -t -A -F'|' -c "
+        SELECT id, name, shard FROM deployment_schemas
+        WHERE subgraph = '$deployment_hash' $meta_filter
+        ORDER BY id;")
+
+    # Deployment rows in the target data DB
+    local data_ids
+    data_ids=$(psql_retry "$TARGET_DATA_DB" -t -A -c "
+        SELECT id FROM subgraphs.deployment
+        WHERE subgraph = '$deployment_hash' $data_filter
+        ORDER BY id;")
+
+    # Numeric id lists per database. Deletion commands are scoped per database:
+    # metadata ids are only offered for deletion in the metadata DB, and the
+    # data-DB list is cross-checked against subgraphs.deployment so an id that
+    # provably belongs to a DIFFERENT deployment there is never offered.
+    local meta_ids data_ids_clean all_ids
+    meta_ids=$(printf '%s\n' "$meta_rows" | cut -d'|' -f1 | grep -E '^[0-9]+$' | sort -un | paste -sd, - || true)
+    data_ids_clean=$(printf '%s\n' "$data_ids" | grep -E '^[0-9]+$' | sort -un | paste -sd, - || true)
+    all_ids=$(printf '%s,%s' "$meta_ids" "$data_ids_clean" | tr ',' '\n' | grep -E '^[0-9]+$' | sort -un | paste -sd, - || true)
+
+    if [[ -z "$all_ids" ]]; then
+        log_success "Deployment does not exist in target (safe to proceed)"
+        return 0
+    fi
+
+    # Ids that belong to another deployment in the target data DB (id spaces can
+    # diverge if the two target DBs are not from the same graph-node cluster).
+    local conflict_ids
+    conflict_ids=$(psql_retry "$TARGET_DATA_DB" -t -A -c "
+        SELECT id FROM subgraphs.deployment
+        WHERE id IN ($all_ids) AND subgraph <> '$deployment_hash'
+        ORDER BY id;" 2>/dev/null | paste -sd, - || true)
+
+    # Data-DB deletion list: every leftover id except proven conflicts, and never
+    # the source's own id when source and target share the data DB.
+    local id data_del_ids="" meta_del_ids=""
+    for id in ${all_ids//,/ }; do
+        [[ ",$conflict_ids," == *",$id,"* ]] && continue
+        [[ "$TARGET_DATA_DB" == "$SOURCE_DATA_DB" && "$id" == "$source_reg_id" ]] && continue
+        data_del_ids="${data_del_ids:+$data_del_ids,}$id"
+    done
+    # Metadata-DB deletion list: only ids actually seen in the metadata registry,
+    # and never the source's own id when the metadata DB is shared.
+    for id in ${meta_ids//,/ }; do
+        [[ "$TARGET_METADATA_DB" == "$SOURCE_METADATA_DB" && "$id" == "$source_reg_id" ]] && continue
+        meta_del_ids="${meta_del_ids:+$meta_del_ids,}$id"
+    done
+
+    log_error "Deployment '$deployment_hash' already exists in target database(s)"
+    echo ""
+    echo "Leftover rows were found, most likely from a previous failed or partial"
+    echo "migration attempt (ids: $all_ids)."
+    echo ""
+
+    if [[ -n "$meta_rows" ]]; then
+        echo "deployment_schemas rows in TARGET metadata DB:"
+        while IFS='|' read -r r_id r_name r_shard; do
+            [[ -n "$r_id" ]] && echo "    id=$r_id  name=$r_name  shard=$r_shard"
+        done <<< "$meta_rows"
+    fi
+    if [[ -n "$data_ids" ]]; then
+        echo "subgraphs.deployment rows in TARGET data DB:"
+        echo "    ids: $(printf '%s\n' "$data_ids" | paste -sd, -)"
+    fi
+
+    if [[ -n "$conflict_ids" ]]; then
+        echo ""
+        log_warning "Ids $conflict_ids belong to a DIFFERENT deployment in the target data DB."
+        log_warning "They are excluded from the data-DB deletion commands below. This usually"
+        log_warning "means TARGET_METADATA_DB and TARGET_DATA_DB are not from the same cluster."
+    fi
+
+    local head_n manifest_n assign_n sgd_names orphan_schemas=""
+    if [[ -n "$data_del_ids" ]]; then
+        # Leftover row counts in the target data DB for the ids found
+        head_n=$(psql_retry "$TARGET_DATA_DB" -t -A -c "SELECT COUNT(*) FROM subgraphs.head WHERE id IN ($data_del_ids);" 2>/dev/null || echo "?")
+        manifest_n=$(psql_retry "$TARGET_DATA_DB" -t -A -c "SELECT COUNT(*) FROM subgraphs.subgraph_manifest WHERE id IN ($data_del_ids);" 2>/dev/null || echo "?")
+        assign_n=$(psql_retry "$TARGET_DATA_DB" -t -A -c "SELECT COUNT(*) FROM subgraphs.subgraph_deployment_assignment WHERE id IN ($data_del_ids);" 2>/dev/null || echo "?")
+        echo "Related rows in TARGET data DB: head=$head_n manifest=$manifest_n assignment=$assign_n"
+
+        # Any orphaned entity schemas (sgdNNN) in the target data DB
+        sgd_names=$(printf '%s' "$data_del_ids" | tr ',' '\n' | sed "s/.*/'sgd&'/" | paste -sd, -)
+        orphan_schemas=$(psql_retry "$TARGET_DATA_DB" -t -A -c "
+            SELECT schema_name FROM information_schema.schemata
+            WHERE schema_name IN ($sgd_names);" 2>/dev/null || true)
+        if [[ -n "$orphan_schemas" ]]; then
+            echo "Entity schemas in TARGET data DB: $(printf '%s\n' "$orphan_schemas" | paste -sd, -)"
+        fi
+    fi
+
+    echo ""
+    echo "If these are confirmed leftovers you want to remove, review then run:"
+
+    if [[ -n "$data_del_ids" ]]; then
+        cat <<EOF
+
+--- 1. In the TARGET DATA database:  psql "\$TARGET_DATA_DB" ---
+BEGIN;
+DELETE FROM subgraphs.subgraph_manifest              WHERE id IN ($data_del_ids);
+DELETE FROM subgraphs.subgraph_deployment_assignment WHERE id IN ($data_del_ids);
+DELETE FROM subgraphs.deployment                     WHERE id IN ($data_del_ids);
+DELETE FROM subgraphs.head                           WHERE id IN ($data_del_ids);
+COMMIT;
+EOF
+        if [[ -n "$orphan_schemas" ]]; then
+            while IFS= read -r s; do
+                [[ -n "$s" ]] && echo "DROP SCHEMA IF EXISTS $s CASCADE;"
+            done <<< "$orphan_schemas"
+        fi
+    fi
+    if [[ -n "$meta_del_ids" ]]; then
+        cat <<EOF
+
+--- 2. In the TARGET METADATA database:  psql "\$TARGET_METADATA_DB" ---
+BEGIN;
+DELETE FROM subgraphs.subgraph_deployment_assignment WHERE id IN ($meta_del_ids);
+DELETE FROM deployment_schemas                       WHERE id IN ($meta_del_ids);
+COMMIT;
+EOF
+    fi
+    cat <<EOF
+
+Notes:
+  - The id lists are scoped per database, cross-checked against
+    subgraphs.deployment in the target data DB, and never include the source
+    deployment's id.
+  - subgraphs.subgraph / subgraphs.subgraph_version rows are intentionally NOT
+    deleted: they are keyed by the subgraph entity (may be shared), and a
+    re-run safely skips them as duplicates.
+
+Then re-run this script.
+EOF
+    exit 1
 }
 
 # Function to get deployment information from source
@@ -538,23 +862,19 @@ migrate_metadata() {
             else
                 # Version doesn't exist by unique key, migrate it with source ID
                 log_info "Migrating graph_node_version $version_id..."
-                psql "$SOURCE_DATA_DB" -c "
+                psql_to_file_retry "$MIGRATION_TEMP_DIR/graph_node_versions.tsv" "$SOURCE_DATA_DB" -c "
                     COPY (SELECT * FROM subgraphs.graph_node_versions WHERE id = $version_id)
                     TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-                " > "$MIGRATION_TEMP_DIR/graph_node_versions.tsv" 2>&1 || {
-                    log_warning "Could not export graph_node_version"
-                }
+                " || log_warning "Could not export graph_node_version"
 
                 if [ -s "$MIGRATION_TEMP_DIR/graph_node_versions.tsv" ]; then
+                    # `|| true`: non-critical imports return 1 on failure after warning;
+                    # without the guard, set -e would abort the whole migration here.
                     log_info "Importing graph_node_version to data database..."
-                    cat "$MIGRATION_TEMP_DIR/graph_node_versions.tsv" | psql "$TARGET_DATA_DB" -c "
-                        COPY subgraphs.graph_node_versions FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-                    " || log_error "Failed to import graph_node_version to data DB"
+                    import_record_safe "Graph node version (data DB)" "$MIGRATION_TEMP_DIR/graph_node_versions.tsv" "$TARGET_DATA_DB" "subgraphs.graph_node_versions" "false" || true
 
                     log_info "Importing graph_node_version to metadata database..."
-                    cat "$MIGRATION_TEMP_DIR/graph_node_versions.tsv" | psql "$TARGET_METADATA_DB" -c "
-                        COPY subgraphs.graph_node_versions FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-                    " || log_warning "Failed to import graph_node_version to metadata DB (may already exist)"
+                    import_record_safe "Graph node version (metadata DB)" "$MIGRATION_TEMP_DIR/graph_node_versions.tsv" "$TARGET_METADATA_DB" "subgraphs.graph_node_versions" "false" || true
 
                     log_success "Graph node version $version_id migrated"
                 else
@@ -575,7 +895,7 @@ migrate_metadata() {
     # STEP 2: Insert deployment_schemas (registry entry)
     # ============================================================================
     log_info "Inserting into deployment_schemas..."
-    psql "$TARGET_METADATA_DB" -c "
+    exec_write_retry "deployment_schemas entry (metadata DB)" "$TARGET_METADATA_DB" "
         INSERT INTO deployment_schemas (id, created_at, subgraph, name, shard, version, network, active)
         VALUES (
             $TARGET_ID,
@@ -587,17 +907,17 @@ migrate_metadata() {
             '$SOURCE_NETWORK',
             '$SOURCE_ACTIVE'
         );
-    "
+    " "true"
 
     # ============================================================================
     # STEP 3: Migrate subgraphs.head (required by deployment FK)
     # ============================================================================
     log_info "Migrating subgraph head..."
 
-    psql "$SOURCE_DATA_DB" -c "
+    psql_to_file_retry "$MIGRATION_TEMP_DIR/head_source.tsv" "$SOURCE_DATA_DB" -c "
         COPY (SELECT * FROM subgraphs.head WHERE id = $SOURCE_ID)
         TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-    " > "$MIGRATION_TEMP_DIR/head_source.tsv"
+    "
 
     if [ -s "$MIGRATION_TEMP_DIR/head_source.tsv" ]; then
         # Replace the source ID with target ID using Python for CSV parsing
@@ -631,10 +951,10 @@ with open('$MIGRATION_TEMP_DIR/head_source.tsv', 'r') as infile, \
     ")
     log_info "Deployment table columns: $deployment_columns"
 
-    psql "$SOURCE_DATA_DB" -c "
+    psql_to_file_retry "$MIGRATION_TEMP_DIR/deployment_source.tsv" "$SOURCE_DATA_DB" -c "
         COPY (SELECT * FROM subgraphs.deployment WHERE subgraph = '$deployment_hash')
         TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-    " > "$MIGRATION_TEMP_DIR/deployment_source.tsv"
+    "
 
     if [ -s "$MIGRATION_TEMP_DIR/deployment_source.tsv" ]; then
         # Debug: show the source data
@@ -682,7 +1002,10 @@ with open('$MIGRATION_TEMP_DIR/deployment_source.tsv', 'r') as infile, \
 
         # Verify what we just inserted
         log_info "Verifying deployment record in target data database..."
-        psql "$TARGET_DATA_DB" -c "SELECT id, subgraph FROM subgraphs.deployment WHERE subgraph = '$deployment_hash';"
+        # Non-fatal: this is a read-only sanity check. A transient connection blip
+        # here must NOT abort the migration (the import above already succeeded).
+        psql_retry "$TARGET_DATA_DB" -c "SELECT id, subgraph FROM subgraphs.deployment WHERE subgraph = '$deployment_hash';" \
+            || log_warning "Could not verify deployment record (connection issue) - continuing; the import above already succeeded"
     else
         log_info "No deployment record found (will be created by graph-node)"
     fi
@@ -700,10 +1023,10 @@ with open('$MIGRATION_TEMP_DIR/deployment_source.tsv', 'r') as infile, \
     log_info "Manifest table columns: $manifest_columns"
 
     # Use COPY to export with proper NULL handling
-    psql "$SOURCE_DATA_DB" -c "
+    psql_to_file_retry "$MIGRATION_TEMP_DIR/manifest_source.tsv" "$SOURCE_DATA_DB" -c "
         COPY (SELECT * FROM subgraphs.subgraph_manifest WHERE id = $SOURCE_ID)
         TO STDOUT WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-    " > "$MIGRATION_TEMP_DIR/manifest_source.tsv"
+    "
 
     if [ -s "$MIGRATION_TEMP_DIR/manifest_source.tsv" ]; then
         # Debug: show the source data
@@ -758,16 +1081,10 @@ with open('$MIGRATION_TEMP_DIR/manifest_source.tsv', 'r') as infile, \
         echo ""
 
         # Import to data database only (metadata DB doesn't need manifest - graphman doesn't manage it there)
+        # Critical: retries transient connection failures; a genuine failure (e.g. the
+        # FK-to-deployment violation) is not transient/duplicate, so it still exits 1.
         log_info "Importing manifest to data database..."
-        local manifest_error=""
-        if ! manifest_error=$(cat "$MIGRATION_TEMP_DIR/manifest.tsv" | psql "$TARGET_DATA_DB" -c "
-            COPY subgraphs.subgraph_manifest FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N', ENCODING 'UTF8');
-        " 2>&1); then
-            log_error "Manifest import failed: $manifest_error"
-            log_error "This is a critical error - the subgraph will not start without a manifest record"
-            exit 1
-        fi
-        log_success "Manifest imported to data database"
+        import_record_safe "Manifest record (data DB)" "$MIGRATION_TEMP_DIR/manifest.tsv" "$TARGET_DATA_DB" "subgraphs.subgraph_manifest" "true"
     else
         log_warning "No manifest data found for deployment"
     fi
